@@ -1,0 +1,5 @@
+# M0 抓取
+httpx>=0.27
+python-dotenv>=1.0
+# M1 分析管线
+langgraph>=1.0

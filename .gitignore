@@ -1,0 +1,11 @@
+# 密钥与本地配置（绝不入库）
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# 抓取与分析产物（可重新生成）
+data/
+reports/
