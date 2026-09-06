@@ -72,24 +72,22 @@ def make_graph(llm: DeepSeekClient):
         print(f"  [N2a 候选挑选] {time.time()-t0:.1f}s 选中 {len(picks)} 处")
         return {"picks": picks}
 
-    def _resolve_quote(state: PipelineState, thread_id: str) -> str:
-        """按路径 ['T5', 'T5_回复2', 'T5_回复2_回复3', …] 任意深度解析回原文；
-        找不到返回空串。"""
+    def _resolve_quote(state: PipelineState, thread_id: str) -> tuple[str, int]:
+        """按路径 ['T5', 'T5_回复2', 'T5_回复2_回复3', …] 任意深度解析回原文，
+        返回 (文本, 抓取时刻点赞数)；找不到返回 ("", 0)。"""
         path = _parse_tid(thread_id)
         if not path:
-            return ""
+            return "", 0
         idx = path[0]
         if idx >= len(state["threads_mini"]):
-            return ""
+            return "", 0
         node: dict = state["threads_mini"][idx]
-        if len(path) == 1:
-            return node["text"]
         for step in path[1:]:
             kids = node.get("replies") or []
             if step >= len(kids):
-                return ""
+                return "", 0
             node = kids[step]
-        return node["text"]
+        return node.get("text", ""), node.get("like", 0)
 
     def autopsy(state: PipelineState) -> dict:
         # 输入：每个 pick 对应"整楼文本"（含主楼与回复，回复带 [Tx_回复N] 标记），
@@ -104,9 +102,10 @@ def make_graph(llm: DeepSeekClient):
             return {"autopsy": {"items": []}}
         t0 = time.time()
         r = nodes.node_autopsy(llm, items)
-        # 关键一步：把解剖结果与原文对齐（注入 quote，供报告直接引用）
+        # 关键一步：把解剖结果与原文对齐（注入 quote 与赞数，供报告引用与定位）
         for it in r.get("items", []):
-            it["quote"] = _resolve_quote(state, it.get("thread_id", ""))
+            it["quote"], it["quote_like"] = _resolve_quote(
+                state, it.get("thread_id", ""))
         print(f"  [N2b 垃圾解剖] {time.time()-t0:.1f}s 解剖 {len(r.get('items', []))} 处")
         return {"autopsy": r}
 
@@ -130,7 +129,8 @@ def make_graph(llm: DeepSeekClient):
         r = nodes.node_best_args(llm, corpus, exclude)
         # 范本同样附原文
         for it in r.get("items", []):
-            it["quote"] = _resolve_quote(state, it.get("thread_id", ""))
+            it["quote"], it["quote_like"] = _resolve_quote(
+                state, it.get("thread_id", ""))
         print(f"  [N3 最佳论证] {time.time()-t0:.1f}s 范本 {len(r.get('items', []))} 条")
         return {"best_args": r}
 
@@ -245,14 +245,16 @@ def _thread_block_text(state: PipelineState, tid: str) -> str | None:
     return "\n".join(lines)
 
 
-def _q(quote: str) -> str:
-    """引用原文（多行压成一行、去回复缩进）并转成引用块。"""
+def _q(quote: str, like: int = 0) -> str:
+    """引用原文（多行压成一行、去回复缩进）并转成引用块，
+    附抓取时刻的赞数供原评论区定位。"""
     if not quote:
         return ""
     one = " ".join(quote.split())
     if len(one) > 150:
         one = one[:150] + "…"
-    return f"\n> {one}"
+    like_note = f"（抓取时 {like} 赞）" if like else ""
+    return f"\n> {one}{like_note}"
 
 
 def render_report(s: PipelineState) -> str:
@@ -268,13 +270,13 @@ def render_report(s: PipelineState) -> str:
     L.append(f"# 评论区思辨报告\n")
     L.append(f"**视频**：{meta.get('title', '?')}")
     L.append(f"**链接**：https://www.bilibili.com/video/{meta.get('bvid', '')}")
-    L.append(f"**分析范围**：热评前 {s.get('threads_total', '?')} 条主评论（含楼中楼）\n")
-    L.append("> **如何按编号在原评论区定位**：打开视频评论区，把排序切换为"
-             "**「按热度」**。`[T0]` = 热度第 1 条主评论（最上面那条），"
-             "`[T12]` = 从上往下第 13 条主评论。回复编号同理：`T12_回复3` = "
-             "点开 T12 的回复后，楼中楼里从上往下第 3 条（展开时默认的热度顺序）。"
-             "编号由点赞数生成，与 B站热度排序接近但可能因平台算法有少量错位；"
-             "切换「按时间」排序后编号无法对应。\n")
+    L.append(f"**分析范围**：热评前 {s.get('threads_total', '?')} 条主评论（含楼中楼）")
+    L.append(f"**抓取时间**：{meta.get('fetched_at', '?')}（UTC）\n")
+    L.append("> **引用定位**：编号按抓取时刻的 B站「按热度」排序生成——"
+             "`[T0]` = 热度第 1 条主评论，`[T12]` = 从上往下第 13 条；"
+             "`T12_回复3` = 点开 T12 后楼中楼第 3 条（热度序）。"
+             "抓取后热度会随点赞变化重排，位置对不上时，按引用旁的原文和"
+             "「抓取时 N 赞」在评论区对照查找。\n")
     L.append("> 本报告分析**论证质量**，不评判任何立场对错。评论一律匿名。\n")
 
     # ── 一、争论地图 ──
@@ -304,7 +306,8 @@ def render_report(s: PipelineState) -> str:
     L.append("> 以下是评论中**高赞/高传播但论证质量低**的代表。注意：分析论证不评"
              "立场；每条都标注了其中值得回应的内核。\n")
     for item in au.get("items", []):
-        L.append(f"### 解剖对象 {item.get('thread_id')}{_q(item.get('quote', ''))}\n")
+        L.append(f"### 解剖对象 {item.get('thread_id')}"
+                 f"{_q(item.get('quote', ''), item.get('quote_like', 0))}\n")
         layers = [
             ("论据", item.get("evidence_problems")),
             ("推理", item.get("reasoning_problems")),
@@ -321,7 +324,7 @@ def render_report(s: PipelineState) -> str:
     # ── 三、最佳论证 ──
     L.append("\n## 三、值得学习的论证范本\n")
     for i, b in enumerate(ba.get("items", []), 1):
-        quote = _q(b.get("quote", ""))
+        quote = _q(b.get("quote", ""), b.get("quote_like", 0))
         L.append(f"{i}. **{b.get('thread_id')}**（{b.get('stance', '?')}）：{b.get('why_good')}"
                  f"{quote}\n")
 

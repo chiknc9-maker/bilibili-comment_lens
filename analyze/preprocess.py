@@ -59,7 +59,13 @@ class Thread:
 
 
 def load_threads(json_path: Path) -> tuple[dict, list[Thread]]:
-    """读取抓取 JSON，返回 (meta, threads)；按点赞数降序。"""
+    """读取抓取 JSON，返回 (meta, threads)。
+
+    顺序保持抓取时的 B站热度序（mode=3），不做任何重排——这样 T 编号
+    与用户在原评论区「按热度」从上往下数出的位置一一对应。
+    注意：不按点赞数重排；点赞数与热度序本来就不是一回事，重排只会
+    让编号在界面上无法定位。
+    """
     raw = json.loads(json_path.read_text(encoding="utf-8"))
     threads = []
     for t in raw["threads"]:
@@ -68,7 +74,6 @@ def load_threads(json_path: Path) -> tuple[dict, list[Thread]]:
             rpid=t["rpid"], uname=t["uname"], like=t.get("like", 0),
             text=clean_text(t["text"]), replies=subs,
         ))
-    threads.sort(key=lambda t: t.like, reverse=True)
     return raw["meta"], threads
 
 
