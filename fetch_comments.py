@@ -141,34 +141,63 @@ def fetch_thread_subs(client: httpx.Client, aid: int, root_rpid: int,
     """抓取一条主评论的楼中楼回复（最多 sub_limit 条，按热度）。
 
     重要机制：B站 reply 接口已不再返回二级评论的 rcount（恒 0），但
-    root=<二级rpid> 会返回以该二级为根的整棵对话树（扁平列表，每项带
-    parent 指针）。因此对"争论深"（主评论 rcount >= floor）的楼，
-    逐个下钻二级，按 parent==该二级 筛出真正的三级（"回复的回复"）。
+    root=<二级rpid> 会返回以该二级为根的对话树多层展开（扁平列表，
+    实测单次请求可含至五六级的后代，每项带 parent 指针）。
+    因此对"争论深"（主评论 rcount >= floor）的楼，逐个请求二级，
+    用 fetch_subtree 把返回数据本地重组装成完整嵌套树。
     """
     subs = fetch_replies(client, aid, root_rpid, sub_limit, delay)
     if depth3_limit > 0 and main_rcount >= depth3_floor:
         for s in subs:
-            s["replies"] = fetch_depth3(client, aid, s["rpid"],
-                                        depth3_limit, delay)
+            s["replies"] = fetch_subtree(client, aid, s["rpid"],
+                                         depth3_limit, delay)
     return subs
 
 
-def fetch_depth3(client: httpx.Client, aid: int, sub_rpid: int,
-                 limit: int, delay: float) -> list:
-    """下钻二级评论，取其直接回复（三级）。root=二级 的返回含对话树
-    （含二级自身与其他层级），按 parent==sub_rpid 且 rpid!=sub_rpid 过滤。"""
+def fetch_subtree(client: httpx.Client, aid: int, sub_rpid: int,
+                  child_limit: int, delay: float) -> list:
+    """下钻二级评论并本地重组装其对话树（直到接口返回的叶子）。
+
+    接口一次返回以 sub_rpid 为根的多层展开（含其自身与各级后代，可能
+    混入同主楼其他分支）。重组装规则：从 sub_rpid 自身出发，凡 parent
+    落在已收集集合中的项都收为对应父节点的子级；无 parent 可达的项
+    （其他分支）丢弃。每层按点赞数截断 child_limit 条。
+    """
     d = api_get(client, "/x/v2/reply/reply",
                 {"type": TYPE_VIDEO, "oid": aid, "root": sub_rpid,
                  "pn": 1, "ps": 20, "mode": 3})
     batch = d.get("replies") or []
-    out = []
-    for r in batch:
-        if r.get("parent") == sub_rpid and r.get("rpid") != sub_rpid:
-            out.append(normalize_reply(r))
-        if len(out) >= limit:
-            break
+    items = {r["rpid"]: r for r in batch if r.get("rpid")}
+    root = items.get(sub_rpid)
     time.sleep(delay)
-    return out
+    if root is None:
+        # 根自身未出现在返回中（罕见）：退化为取 parent 指向自身的直接子
+        return [normalize_reply(r) for r in batch
+                if r.get("parent") == sub_rpid][:child_limit]
+
+    # 收集集合：从根开始，把 parent 在集合内的项逐轮并入
+    collected = {root["rpid"]}
+    changed = True
+    while changed:
+        changed = False
+        for r in batch:
+            rp = r.get("rpid")
+            if rp in collected or not r.get("parent"):
+                continue
+            if r["parent"] in collected:
+                collected.add(rp)
+                changed = True
+
+    # 组装嵌套：children[rpid] -> [子项]
+    def build(node: dict) -> dict:
+        kids = [r for r in batch if r.get("parent") == node["rpid"]
+                and r["rpid"] != node["rpid"] and r["rpid"] in collected]
+        kids.sort(key=lambda r: r.get("like", 0), reverse=True)
+        node["replies"] = [build(r) for r in kids[:child_limit]]
+        return node
+
+    built = build(root)
+    return built["replies"]
 
 
 def main():
@@ -180,9 +209,9 @@ def main():
                     help="不抓楼中楼，只抓主评论")
     ap.add_argument("--sub-limit", type=int, default=20,
                     help="每条主评论最多抓多少条楼中楼回复（默认 20）")
-    ap.add_argument("--depth3-limit", type=int, default=3,
-                    help="争论深的楼中楼回复最多抓多少条'回复的回复'（三级，"
-                         "默认 3；0=关闭三级抓取）")
+    ap.add_argument("--depth3-limit", type=int, default=5,
+                    help="深树下钻时每个节点最多保留多少条直接回复（默认 5，"
+                         "树深度由接口返回决定，可达五六级；0=不下钻）")
     ap.add_argument("--depth3-floor", type=int, default=10,
                     help="主评论楼中楼总数达到此值才下钻三级（默认 10，"
                          "控制请求量）")
@@ -257,13 +286,15 @@ def main():
         out_path = OUT_DIR / f"{bvid}_comments.json"
         out_path.write_text(json.dumps(out, ensure_ascii=False, indent=1),
                             encoding="utf-8")
+        def tree_count(items) -> int:
+            return sum(1 + tree_count(x.get("replies") or []) for x in items)
+
         n_subs = sum(len(t["replies"]) for t in threads)
-        n_d3 = sum(len(s.get("replies") or [])
-                   for t in threads for s in t["replies"])
+        n_tree = sum(tree_count(t["replies"]) for t in threads)
         n_deep = sum(1 for t in threads if t["rcount"] > len(t["replies"]))
-        print(f"\n完成: 主评论 {len(threads)} 条, 楼中楼回复 {n_subs} 条"
-              f"（含'回复的回复' {n_d3} 条）")
-        print(f"仍有更深层争论的楼 {n_deep} 个（本次未下钻，可调大 depth3_limit）")
+        print(f"\n完成: 主评论 {len(threads)} 条, 直接回复 {n_subs} 条, "
+              f"深树对话共 {n_tree} 条")
+        print(f"仍有更深层争论的楼 {n_deep} 个（可调大 depth3_floor 覆盖更多楼）")
         print(f"已保存: {out_path}")
 
 

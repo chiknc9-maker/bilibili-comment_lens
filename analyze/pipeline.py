@@ -44,15 +44,14 @@ class PipelineState(TypedDict, total=False):
 
 def make_graph(llm: DeepSeekClient):
     def prepare(state: PipelineState) -> dict:
-        threads_mini = []
-        for t in state["threads"]:
-            threads_mini.append({
-                "text": t.text,
-                "replies": [{"text": r["text"],
-                             "replies": [{"text": d3["text"]}
-                                         for d3 in r.get("replies") or []]}
-                            for r in t.replies],
-            })
+        # 脱敏后的树结构（仅 like/text/replies），供引用与文本块组装
+        def mini(node: dict) -> dict:
+            return {"like": node.get("like", 0), "text": node["text"],
+                    "replies": [mini(k) for k in node.get("replies") or []]}
+
+        threads_mini = [{"text": t.text,
+                         "replies": [mini(r) for r in t.replies]}
+                        for t in state["threads"]]
         return {
             "meta": state["meta"],
             "corpus_text": state["corpus_text"],
@@ -74,25 +73,23 @@ def make_graph(llm: DeepSeekClient):
         return {"picks": picks}
 
     def _resolve_quote(state: PipelineState, thread_id: str) -> str:
-        """把 'T5' / 'T5_回复2' / 'T5_回复2_回复3' 解析回原文；找不到返回空串。"""
-        parsed = _parse_tid(thread_id)
-        if not parsed:
+        """按路径 ['T5', 'T5_回复2', 'T5_回复2_回复3', …] 任意深度解析回原文；
+        找不到返回空串。"""
+        path = _parse_tid(thread_id)
+        if not path:
             return ""
-        idx, reply_i, d3_i = parsed
+        idx = path[0]
         if idx >= len(state["threads_mini"]):
             return ""
-        t = state["threads_mini"][idx]
-        if reply_i is not None:
-            if reply_i >= len(t["replies"]):
+        node: dict = state["threads_mini"][idx]
+        if len(path) == 1:
+            return node["text"]
+        for step in path[1:]:
+            kids = node.get("replies") or []
+            if step >= len(kids):
                 return ""
-            r = t["replies"][reply_i]
-            if d3_i is not None:
-                d3s = r.get("replies") or []
-                if d3_i >= len(d3s):
-                    return ""
-                return d3s[d3_i]["text"]
-            return r["text"]
-        return t["text"]
+            node = kids[step]
+        return node["text"]
 
     def autopsy(state: PipelineState) -> dict:
         # 输入：每个 pick 对应"整楼文本"（含主楼与回复，回复带 [Tx_回复N] 标记），
@@ -212,19 +209,21 @@ def filter_out_threads(corpus_text: str, exclude_ids: list[str]) -> str:
     return "\n\n".join(kept)
 
 
-def _parse_tid(tid: str) -> tuple[int, int | None, int | None] | None:
-    """'T5' → (5,None,None)；'T5_回复2' → (5,1,None)；'T5_回复2_回复3' → (5,1,2)。"""
-    m = re.fullmatch(r"T(\d+)(?:_回复(\d+))?(?:_回复(\d+))?", tid or "")
+def _parse_tid(tid: str) -> list[int] | None:
+    """'T5' → [5]；'T5_回复2' → [5, 1]；'T5_回复2_回复3' → [5, 1, 2]。
+    返回从主楼起的 0-based 路径；解析失败返回 None。"""
+    m = re.fullmatch(r"T(\d+)(?:(?:_回复(\d+))*)$", tid or "")
     if not m:
         return None
-    return (int(m.group(1)),
-            (int(m.group(2)) - 1 if m.group(2) else None),
-            (int(m.group(3)) - 1 if m.group(3) else None))
+    path = [int(m.group(1))]
+    for g in re.findall(r"_回复(\d+)", tid):
+        path.append(int(g) - 1)
+    return path
 
 
 def _thread_block_text(state: PipelineState, tid: str) -> str | None:
-    """取某一楼完整文本块（主楼 + 全部回复，二级/三级均带 [Tx_回复N] 标记），
-    供解剖节点选择任一层级。tid 指向该楼即可。"""
+    """取某一楼完整文本块（主楼 + 任意深度的对话树，每节点带 [Tx_回复…] 标记），
+    供解剖节点选择任一层级。tid 指向该楼即可（主楼或任一后代皆可）。"""
     parsed = _parse_tid(tid)
     if not parsed:
         return None
@@ -233,11 +232,16 @@ def _thread_block_text(state: PipelineState, tid: str) -> str | None:
         return None
     t = state["threads_mini"][idx]
     lines = [f"[T{idx}]（主楼）{t['text']}"]
-    for n, r in enumerate(t["replies"], 1):
-        lines.append(f"  [T{idx}_回复{n}]（回复{n}）{r['text']}")
-        for k, d3 in enumerate(r.get("replies") or [], 1):
-            lines.append(f"    [T{idx}_回复{n}_回复{k}]"
-                         f"（回复{n}的回复{k}）{d3['text']}")
+
+    def render(node: dict, segs: list[str], depth: int):
+        for n, kid in enumerate(node.get("replies") or [], 1):
+            seg = f"_回复{n}" if segs else f"回复{n}"
+            tag = f"[T{idx}_{'_'.join(segs + [seg])}]"
+            indent = "  " * (depth + 1)
+            lines.append(f"{indent}{tag}（{kid['like']}赞）{kid['text']}")
+            render(kid, segs + [seg], depth + 1)
+
+    render({"replies": t["replies"]}, [], 0)
     return "\n".join(lines)
 
 
