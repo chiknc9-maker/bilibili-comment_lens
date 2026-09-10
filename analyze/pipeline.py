@@ -247,14 +247,13 @@ def _thread_block_text(state: PipelineState, tid: str) -> str | None:
 
 def _q(quote: str, like: int = 0) -> str:
     """引用原文（多行压成一行、去回复缩进）并转成引用块，
-    附抓取时刻的赞数供原评论区定位。"""
+    附抓取时刻的赞数供原评论区定位（0 赞也标注）。"""
     if not quote:
         return ""
     one = " ".join(quote.split())
     if len(one) > 150:
         one = one[:150] + "…"
-    like_note = f"（抓取时 {like} 赞）" if like else ""
-    return f"\n> {one}{like_note}"
+    return f"\n> {one}（抓取时 {like} 赞）"
 
 
 def render_report(s: PipelineState) -> str:
