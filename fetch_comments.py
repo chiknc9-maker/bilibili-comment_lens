@@ -35,11 +35,11 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 
 def parse_bvid(raw: str) -> str:
-    """接受 BV 号或完整视频链接，返回 BV 号。"""
+    """接受 BV 号或完整视频链接，返回 BV 号。解析失败抛 ValueError。"""
     m = re.search(r"(BV[0-9A-Za-z]{10})", raw)
     if m:
         return m.group(1)
-    raise SystemExit(f"无法从输入中解析出 BV 号: {raw!r}（应形如 BV1xx...）")
+    raise ValueError(f"无法从输入中解析出 BV 号: {raw!r}（应形如 BV1xx...）")
 
 
 def parse_ts(ts: int) -> str:
@@ -200,6 +200,74 @@ def fetch_subtree(client: httpx.Client, aid: int, sub_rpid: int,
     return built["replies"]
 
 
+def fetch_video(bvid: str, main_total: int = 100, no_subs: bool = False,
+                sub_limit: int = 20, depth3_limit: int = 5,
+                depth3_floor: int = 10, delay: float = 0.4,
+                proxy: str | None = None) -> dict:
+    """抓取单个视频的评论（含深树对话），返回完整数据 dict（含 meta）。
+
+    供 CLI 与网页服务共用。headers 在内部按 cookie 配置构建。
+    """
+    bvid = parse_bvid(bvid)
+    headers = build_headers()
+
+    # trust_env=False：忽略系统代理（B站是国内站，直连更稳，且部分系统的
+    # NO_PROXY 写法会触发 httpx 解析 bug）。需要代理时显式传入。
+    with httpx.Client(headers=headers, timeout=20,
+                      trust_env=False, proxy=proxy) as client:
+        # 1) 视频信息
+        view = api_get(client, "/x/web-interface/view", {"bvid": bvid})
+        aid = view["aid"]
+        stat = view.get("stat") or {}
+        print(f"视频: {view['title']}  (aid={aid})")
+        print(f"  播放 {stat.get('view', '?')} / 弹幕 {stat.get('danmaku', '?')} "
+              f"/ 评论 {stat.get('reply', '?')} / 硬币 {stat.get('coin', '?')}")
+
+        # 2) 主评论翻页（mode=3 热度排序）
+        threads, next_p = [], 1
+        while next_p and (main_total == 0 or len(threads) < main_total):
+            d = api_get(client, "/x/v2/reply/main",
+                        {"type": TYPE_VIDEO, "oid": aid, "mode": 3, "next": next_p})
+            cursor = d.get("cursor") or {}
+            for rep in d.get("replies") or []:
+                t = normalize_reply(rep)
+                if not t["text"].strip():
+                    continue
+                if t["rcount"] > 0 and not no_subs:
+                    t["replies"] = fetch_thread_subs(
+                        client, aid, t["rpid"], sub_limit, delay,
+                        depth3_limit, t["rcount"], depth3_floor)
+                else:
+                    t["replies"] = []
+                threads.append(t)
+                if main_total and len(threads) >= main_total:
+                    break
+            if cursor.get("is_end"):
+                break
+            next_p = cursor.get("next")
+            time.sleep(delay)
+
+        if not threads:
+            raise ValueError("没有抓到任何评论（视频可能关闭了评论区）。")
+
+        return {
+            "meta": {
+                "bvid": bvid,
+                "aid": aid,
+                "title": view["title"],
+                "owner": (view.get("owner") or {}).get("name", ""),
+                "stat": {k: stat.get(k) for k in ("view", "danmaku", "reply", "like")},
+                "fetched_at": datetime.now(tz=timezone.utc).isoformat(),
+                "config": {"main_total_cap": main_total,
+                           "sub_limit": sub_limit,
+                           "depth3_limit": depth3_limit,
+                           "depth3_floor": depth3_floor,
+                           "sort": "hot"},
+            },
+            "threads": threads,
+        }
+
+
 def main():
     ap = argparse.ArgumentParser(description="抓取 B站视频评论（含楼中楼）")
     ap.add_argument("bvid", help="BV 号或视频链接")
@@ -221,81 +289,28 @@ def main():
                     help="手动指定代理，如 http://127.0.0.1:7892")
     args = ap.parse_args()
 
-    bvid = parse_bvid(args.bvid)
-    delay = args.delay
-    headers = build_headers()
+    out = fetch_video(args.bvid, main_total=args.main_total,
+                      no_subs=args.no_subs, sub_limit=args.sub_limit,
+                      depth3_limit=args.depth3_limit,
+                      depth3_floor=args.depth3_floor,
+                      delay=args.delay, proxy=args.proxy)
 
-    # trust_env=False：忽略系统代理（B站是国内站，直连更稳，且部分系统的
-    # NO_PROXY 写法会触发 httpx 解析 bug）。需要代理时用 --proxy 显式指定。
-    with httpx.Client(headers=headers, timeout=20,
-                      trust_env=False, proxy=args.proxy) as client:
-        # 1) 视频信息
-        view = api_get(client, "/x/web-interface/view", {"bvid": bvid})
-        aid = view["aid"]
-        stat = view.get("stat") or {}
-        print(f"视频: {view['title']}  (aid={aid})")
-        print(f"  播放 {stat.get('view', '?')} / 弹幕 {stat.get('danmaku', '?')} "
-              f"/ 评论 {stat.get('reply', '?')} / 硬币 {stat.get('coin', '?')}")
+    def tree_count(items) -> int:
+        return sum(1 + tree_count(x.get("replies") or []) for x in items)
 
-        # 2) 主评论翻页（mode=3 热度排序）
-        threads, next_p, total = [], 1, 0
-        while next_p and (args.main_total == 0 or len(threads) < args.main_total):
-            d = api_get(client, "/x/v2/reply/main",
-                        {"type": TYPE_VIDEO, "oid": aid, "mode": 3, "next": next_p})
-            cursor = d.get("cursor") or {}
-            for rep in d.get("replies") or []:
-                t = normalize_reply(rep)
-                if not t["text"].strip():
-                    continue
-                if t["rcount"] > 0 and not args.no_subs:
-                    t["replies"] = fetch_thread_subs(
-                        client, aid, t["rpid"], args.sub_limit, delay,
-                        args.depth3_limit, t["rcount"], args.depth3_floor)
-                else:
-                    t["replies"] = []
-                threads.append(t)
-                total += 1
-                if args.main_total and len(threads) >= args.main_total:
-                    break
-            if cursor.get("is_end"):
-                break
-            next_p = cursor.get("next")
-            time.sleep(delay)
+    threads = out["threads"]
+    n_subs = sum(len(t["replies"]) for t in threads)
+    n_tree = sum(tree_count(t["replies"]) for t in threads)
+    n_deep = sum(1 for t in threads if t["rcount"] > len(t["replies"]))
+    print(f"\n完成: 主评论 {len(threads)} 条, 直接回复 {n_subs} 条, "
+          f"深树对话共 {n_tree} 条")
+    print(f"仍有更深层争论的楼 {n_deep} 个（可调大 depth3_floor 覆盖更多楼）")
 
-        if not threads:
-            raise SystemExit("没有抓到任何评论（视频可能关闭了评论区）。")
-
-        # 3) 落盘
-        out = {
-            "meta": {
-                "bvid": bvid,
-                "aid": aid,
-                "title": view["title"],
-                "owner": (view.get("owner") or {}).get("name", ""),
-                "stat": {k: stat.get(k) for k in ("view", "danmaku", "reply", "like")},
-                "fetched_at": datetime.now(tz=timezone.utc).isoformat(),
-                "config": {"main_total_cap": args.main_total,
-                           "sub_limit": args.sub_limit,
-                           "depth3_limit": args.depth3_limit,
-                           "depth3_floor": args.depth3_floor,
-                           "sort": "hot"},
-            },
-            "threads": threads,
-        }
-        OUT_DIR.mkdir(exist_ok=True)
-        out_path = OUT_DIR / f"{bvid}_comments.json"
-        out_path.write_text(json.dumps(out, ensure_ascii=False, indent=1),
-                            encoding="utf-8")
-        def tree_count(items) -> int:
-            return sum(1 + tree_count(x.get("replies") or []) for x in items)
-
-        n_subs = sum(len(t["replies"]) for t in threads)
-        n_tree = sum(tree_count(t["replies"]) for t in threads)
-        n_deep = sum(1 for t in threads if t["rcount"] > len(t["replies"]))
-        print(f"\n完成: 主评论 {len(threads)} 条, 直接回复 {n_subs} 条, "
-              f"深树对话共 {n_tree} 条")
-        print(f"仍有更深层争论的楼 {n_deep} 个（可调大 depth3_floor 覆盖更多楼）")
-        print(f"已保存: {out_path}")
+    OUT_DIR.mkdir(exist_ok=True)
+    out_path = OUT_DIR / f"{out['meta']['bvid']}_comments.json"
+    out_path.write_text(json.dumps(out, ensure_ascii=False, indent=1),
+                        encoding="utf-8")
+    print(f"已保存: {out_path}")
 
 
 if __name__ == "__main__":
