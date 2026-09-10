@@ -14,6 +14,7 @@ import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -24,6 +25,14 @@ import fetch_comments as fc        # noqa: E402
 import run_analysis as ra          # noqa: E402
 
 app = FastAPI(title="评论透镜")
+
+# 允许任意来源（本机自用）：兼容用户直接双击 index.html（file:// 源）打开
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 _tasks: dict[str, dict] = {}
 _lock = threading.Lock()

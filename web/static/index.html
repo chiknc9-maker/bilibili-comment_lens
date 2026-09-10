@@ -47,7 +47,7 @@
     <input id="url" placeholder="粘贴视频链接或 BV 号，如 https://www.bilibili.com/video/BV1..." />
     <button id="go">开始分析</button>
   </div>
-  <div class="hint">分析约需 2~6 分钟（抓取评论区 + AI 分析）。可关闭本页稍后再打开，任务在服务端继续。</div>
+  <div class="hint">分析约需 2~6 分钟（抓取评论区 + AI 分析）。推荐直接访问 <b>http://127.0.0.1:8000/</b> 使用；双击文件打开也能用。</div>
 
   <div id="status"></div>
   <div id="report"></div>
@@ -56,6 +56,8 @@
 <script>
 const $ = id => document.getElementById(id);
 let pollTimer = null;
+// 绝对地址：即使页面是直接双击打开（file://），请求也能到达本机服务
+const API = "http://127.0.0.1:8000";
 
 $("go").onclick = async () => {
   const url = $("url").value.trim();
@@ -66,7 +68,7 @@ $("go").onclick = async () => {
   $("status").className = "spin";
   $("status").textContent = "提交中…";
   try {
-    const r = await fetch("/api/analyze", {
+    const r = await fetch(API + "/api/analyze", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url }),
@@ -91,7 +93,7 @@ function poll(taskId) {
   clearInterval(pollTimer);
   pollTimer = setInterval(async () => {
     try {
-      const r = await fetch(`/api/tasks/${taskId}`);
+      const r = await fetch(`${API}/api/tasks/${taskId}`);
       if (!r.ok) return;
       const t = await r.json();
       $("status").className = "spin";
@@ -109,7 +111,7 @@ function poll(taskId) {
 }
 
 async function loadReport(taskId) {
-  const r = await fetch(`/api/tasks/${taskId}/report`);
+  const r = await fetch(`${API}/api/tasks/${taskId}/report`);
   const j = await r.json();
   $("status").textContent = "完成 ✅（报告内容若更新过，请重新分析获取最新快照）";
   $("status").className = "";
