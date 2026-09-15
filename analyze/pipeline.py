@@ -1,14 +1,9 @@
-"""pipeline.py — LangGraph 编排的分析管线
+"""pipeline.py — LangGraph 编排的分析管线（v2 内核）
 
-节点图（DAG）：
-    prepare
-      ├─→ stance_map ──────────────────────────────┐
-      ├─→ pick_junk ──→ autopsy ─┬─→ best_args ─────┤
-      │                           └─→ insights ─────┤
-      └─→ suspect_facts ────────────────────────────┤
-                                                     ▼
-                                                  compose
-（N3 串行在解剖后：须避开解剖名单，避免同评论既被解剖又被表扬）
+节点图（全串行单链，每节点仅一个直接前驱）：
+    prepare → extract_claims → position_map → debate_relations
+           → pick_diagnosis → argument_diagnosis → best_args
+           → suspect_facts → cognitive_insights → compose
 
 节点都是纯函数 (state: dict) -> dict，只写自己负责的字段。
 模型调用统一走 analyze.llm.DeepSeekClient（JSON mode 结构化输出）。
@@ -31,14 +26,16 @@ class PipelineState(TypedDict, total=False):
     meta: dict
     threads: list               # Thread dataclass 列表（入口传入，prepare 消费）
     corpus_text: str
-    threads_mini: list[dict]    # 结构化 thread（供原文引用，不失真）
+    threads_mini: list[dict]    # 脱敏树结构（供原文引用，不失真）
     threads_total: int
-    stance_map: dict
+    claims: dict
+    position_map: dict
+    debate_relations: dict
     picks: list[dict]
-    autopsy: dict
-    insights: dict
+    diagnosis: dict
     best_args: dict
     suspect_facts: dict
+    insights: dict
     report_md: str
 
 
@@ -59,22 +56,42 @@ def make_graph(llm: DeepSeekClient):
             "threads_total": len(state["threads"]),
         }
 
-    def stance_map(state: PipelineState) -> dict:
+    def extract_claims(state: PipelineState) -> dict:
         t0 = time.time()
-        r = nodes.node_stance_map(llm, state["corpus_text"])
-        print(f"  [N1 立场地图] {time.time()-t0:.1f}s 阵营数: {len(r.get('stances', []))}")
-        return {"stance_map": r}
+        r = nodes.node_extract_claims(llm, state["corpus_text"])
+        print(f"  [M1 命题提取] {time.time()-t0:.1f}s "
+              f"命题 {len(r.get('claims', []))} 条 / "
+              f"非论证 {len(r.get('non_argument_comments', []))} 条")
+        return {"claims": r}
 
-    def pick_junk(state: PipelineState) -> dict:
+    def position_map(state: PipelineState) -> dict:
         t0 = time.time()
-        r = nodes.node_pick_junk(llm, state["corpus_text"])
+        r = nodes.node_position_map(llm, state.get("claims", {}).get("claims", []),
+                                    state["corpus_text"])
+        print(f"  [M2 观点地图] {time.time()-t0:.1f}s "
+              f"观点簇 {len(r.get('positions', []))} / "
+              f"分歧 {len(r.get('core_disputes', []))}")
+        return {"position_map": r}
+
+    def debate_relations(state: PipelineState) -> dict:
+        t0 = time.time()
+        r = nodes.node_debate_relations(
+            llm, state.get("claims", {}).get("claims", []),
+            state.get("position_map", {}), state["corpus_text"])
+        print(f"  [M3 论辩关系] {time.time()-t0:.1f}s "
+              f"关系 {len(r.get('debate_relations', []))} 条 / "
+              f"模式 {len(r.get('debate_patterns', []))}")
+        return {"debate_relations": r}
+
+    def pick_diagnosis(state: PipelineState) -> dict:
+        t0 = time.time()
+        r = nodes.node_pick_diagnosis(llm, state["corpus_text"])
         picks = r.get("picks", [])
-        print(f"  [N2a 候选挑选] {time.time()-t0:.1f}s 选中 {len(picks)} 处")
+        print(f"  [M4a 诊断候选] {time.time()-t0:.1f}s 选中 {len(picks)} 处")
         return {"picks": picks}
 
     def _resolve_quote(state: PipelineState, thread_id: str) -> tuple[str, int]:
-        """按路径 ['T5', 'T5_回复2', 'T5_回复2_回复3', …] 任意深度解析回原文，
-        返回 (文本, 抓取时刻点赞数)；找不到返回 ("", 0)。"""
+        """按路径 ['T5', 'T5_回复2', …] 任意深度解析回原文，返回 (文本, 赞数)。"""
         path = _parse_tid(thread_id)
         if not path:
             return "", 0
@@ -89,9 +106,8 @@ def make_graph(llm: DeepSeekClient):
             node = kids[step]
         return node.get("text", ""), node.get("like", 0)
 
-    def autopsy(state: PipelineState) -> dict:
-        # 输入：每个 pick 对应"整楼文本"（含主楼与回复，回复带 [Tx_回复N] 标记），
-        # 从结构化 threads_mini 组装——不依赖语料文本的格式
+    def argument_diagnosis(state: PipelineState) -> dict:
+        # 输入：每个 pick 对应"整楼文本"（含主楼与回复，回复带 [Tx_回复N] 标记）
         items = []
         for p in state.get("picks", []):
             tid = p["thread_id"]
@@ -99,115 +115,84 @@ def make_graph(llm: DeepSeekClient):
             if block:
                 items.append((tid, block))
         if not items:
-            return {"autopsy": {"items": []}}
+            return {"diagnosis": {"items": []}}
         t0 = time.time()
-        r = nodes.node_autopsy(llm, items)
-        # 关键一步：把解剖结果与原文对齐（注入 quote 与赞数，供报告引用与定位）
+        r = nodes.node_argument_diagnosis(llm, items)
+        # 诊断结果与原文对齐（注入 quote 与赞数，供报告引用与定位）
         for it in r.get("items", []):
             it["quote"], it["quote_like"] = _resolve_quote(
                 state, it.get("thread_id", ""))
-        print(f"  [N2b 垃圾解剖] {time.time()-t0:.1f}s 解剖 {len(r.get('items', []))} 处")
-        return {"autopsy": r}
-
-    def insights(state: PipelineState) -> dict:
-        t0 = time.time()
-        items = (state.get("autopsy") or {}).get("items", [])
-        r = nodes.node_insights(llm, state["corpus_text"], items)
-        print(f"  [N5 洞察] {time.time()-t0:.1f}s "
-              f"观察 {len(r.get('readings', []))} 条 / 开放问题 {len(r.get('open_questions', []))} 个")
-        return {"insights": r}
+        print(f"  [M4b 论证诊断] {time.time()-t0:.1f}s 诊断 {len(r.get('items', []))} 处")
+        return {"diagnosis": r}
 
     def best_args(state: PipelineState) -> dict:
-        # 排除解剖过的主楼（N3 串行在 autopsy 之后）。双保险：
-        # 1) 提示词告知（仅语义提醒）  2) 语料物理删除解剖整楼——模型看不到就不会选
+        # 排除诊断过的主楼（N6 串行在诊断后）。双保险：
+        # 1) 提示词告知  2) 语料物理删除诊断整楼——模型看不到就不会选
         exclude = [it.get("thread_id")
-                   for it in (state.get("autopsy") or {}).get("items", [])
+                   for it in (state.get("diagnosis") or {}).get("items", [])
                    if "_回复" not in it.get("thread_id", "")] or None
         corpus = (filter_out_threads(state["corpus_text"], exclude)
                   if exclude else state["corpus_text"])
         t0 = time.time()
         r = nodes.node_best_args(llm, corpus, exclude)
-        # 范本同样附原文
         for it in r.get("items", []):
             it["quote"], it["quote_like"] = _resolve_quote(
                 state, it.get("thread_id", ""))
-        print(f"  [N3 最佳论证] {time.time()-t0:.1f}s 范本 {len(r.get('items', []))} 条")
+        print(f"  [M6 最佳论证] {time.time()-t0:.1f}s 范本 {len(r.get('items', []))} 条")
         return {"best_args": r}
 
     def suspect_facts(state: PipelineState) -> dict:
         t0 = time.time()
         r = nodes.node_suspect_facts(llm, state["corpus_text"])
-        print(f"  [N4 可疑事实] {time.time()-t0:.1f}s 断言 {len(r.get('facts', []))} 条")
+        print(f"  [M7 可疑事实] {time.time()-t0:.1f}s 断言 {len(r.get('facts', []))} 条")
         return {"suspect_facts": r}
 
+    def cognitive_insights(state: PipelineState) -> dict:
+        t0 = time.time()
+        r = nodes.node_cognitive_insights(
+            llm, state["corpus_text"],
+            state.get("claims", {}).get("claims", []),
+            state.get("position_map", {}),
+            state.get("debate_relations", {}),
+            (state.get("diagnosis") or {}).get("items", []))
+        print(f"  [M5 认知观察] {time.time()-t0:.1f}s "
+              f"观察 {len(r.get('readings', []))} 条 / "
+              f"开放问题 {len(r.get('open_questions', []))} 个")
+        return {"insights": r}
+
     def compose(state: PipelineState) -> dict:
-        # 数据清洗 1：解剖对象与范本撞车时（独立调用不一致的产物），
-        # 主楼解剖优先，同名范本剔除；回复级解剖不影响范本。
-        autopsy_main = {it.get("thread_id")
-                        for it in (state.get("autopsy") or {}).get("items", [])
-                        if "_回复" not in it.get("thread_id", "")}
-        best = (state.get("best_args") or {}).copy()
-        if autopsy_main:
-            best["items"] = [b for b in best.get("items", [])
-                             if b.get("thread_id") not in autopsy_main]
-        # 注意：render 必须使用清洗后的状态（局部合并，勿直接读 state）
-        cleaned = {**state, "best_args": best}
-        return {"best_args": best, "report_md": render_report(cleaned)}
+        return {"report_md": render_report(state)}
 
     g = StateGraph(PipelineState)
     g.add_node("prepare", prepare)
-    g.add_node("stance_map", stance_map)
-    g.add_node("pick_junk", pick_junk)
-    g.add_node("autopsy", autopsy)
-    g.add_node("insights", insights)
+    g.add_node("extract_claims", extract_claims)
+    g.add_node("position_map", position_map)
+    g.add_node("debate_relations", debate_relations)
+    g.add_node("pick_diagnosis", pick_diagnosis)
+    g.add_node("argument_diagnosis", argument_diagnosis)
     g.add_node("best_args", best_args)
     g.add_node("suspect_facts", suspect_facts)
+    g.add_node("cognitive_insights", cognitive_insights)
     g.add_node("compose", compose)
 
+    # 全串行单链：每个节点只有一个直接前驱。
+    # 实测本版本 LangGraph 多入边节点会重复执行（模型调用翻倍），
+    # 串行化后总耗时仅增加约 15 秒（M1 命题提取是绝对瓶颈）。
     g.add_edge(START, "prepare")
-    g.add_edge("prepare", "stance_map")
-    g.add_edge("prepare", "pick_junk")
-    g.add_edge("prepare", "suspect_facts")
-    g.add_edge("pick_junk", "autopsy")
-    # N3 串行在解剖之后（需避开解剖名单）；N5 与 N3 并行
-    g.add_edge("autopsy", "best_args")
-    g.add_edge("autopsy", "insights")
-    # fan-in：全部链都完成后 compose 才执行
-    g.add_edge("stance_map", "compose")
-    g.add_edge("best_args", "compose")
-    g.add_edge("insights", "compose")
-    g.add_edge("suspect_facts", "compose")
+    g.add_edge("prepare", "extract_claims")
+    g.add_edge("extract_claims", "position_map")
+    g.add_edge("position_map", "debate_relations")
+    g.add_edge("debate_relations", "pick_diagnosis")
+    g.add_edge("pick_diagnosis", "argument_diagnosis")
+    g.add_edge("argument_diagnosis", "best_args")
+    g.add_edge("best_args", "suspect_facts")
+    g.add_edge("suspect_facts", "cognitive_insights")
+    g.add_edge("cognitive_insights", "compose")
     g.add_edge("compose", END)
     return g.compile()
 
 
-def filter_out_threads(corpus_text: str, exclude_ids: list[str]) -> str:
-    """从语料文本中物理移除指定主楼（[T5] 开头直到下一个 [T 块的整块）。
-
-    用于 N3：解剖过的整楼从输入中消失，模型不可能再选它做范本。
-    仅回复被解剖的楼（如 T13_回复8）不在排除名单时，整楼保留。
-    """
-    blocks = []
-    cur = None
-    for line in corpus_text.split("\n"):
-        if line.startswith("[T") and "]" in line[:6]:
-            if cur is not None:
-                blocks.append("\n".join(cur))
-            cur = [line]
-        elif cur is not None:
-            cur.append(line)
-    if cur is not None:
-        blocks.append("\n".join(cur))
-
-    excluded = {tid for tid in exclude_ids if "_回复" not in tid}
-    kept = []
-    for blk in blocks:
-        m = re.match(r"\[T(\d+)\]", blk)
-        if m and f"T{int(m.group(1))}" in excluded:
-            continue  # 解剖过的整楼，跳过
-        kept.append(blk)
-    return "\n\n".join(kept)
-
+# ────────────────────────── 工具函数 ──────────────────────────
 
 def _parse_tid(tid: str) -> list[int] | None:
     """'T5' → [5]；'T5_回复2' → [5, 1]；'T5_回复2_回复3' → [5, 1, 2]。
@@ -223,7 +208,7 @@ def _parse_tid(tid: str) -> list[int] | None:
 
 def _thread_block_text(state: PipelineState, tid: str) -> str | None:
     """取某一楼完整文本块（主楼 + 任意深度的对话树，每节点带 [Tx_回复…] 标记），
-    供解剖节点选择任一层级。tid 指向该楼即可（主楼或任一后代皆可）。"""
+    供诊断节点选择任一层级。tid 指向该楼即可。"""
     parsed = _parse_tid(tid)
     if not parsed:
         return None
@@ -245,9 +230,34 @@ def _thread_block_text(state: PipelineState, tid: str) -> str | None:
     return "\n".join(lines)
 
 
+def filter_out_threads(corpus_text: str, exclude_ids: list[str]) -> str:
+    """从语料文本中物理移除指定主楼（[T5] 开头直到下一个 [T 块的整块）。
+
+    用于 M6：诊断过的整楼从输入中消失，模型不可能再选它做范本。
+    """
+    blocks, cur = [], None
+    for line in corpus_text.split("\n"):
+        if line.startswith("[T") and "]" in line[:6]:
+            if cur is not None:
+                blocks.append("\n".join(cur))
+            cur = [line]
+        elif cur is not None:
+            cur.append(line)
+    if cur is not None:
+        blocks.append("\n".join(cur))
+
+    excluded = {tid for tid in exclude_ids if "_回复" not in tid}
+    kept = []
+    for blk in blocks:
+        m = re.match(r"\[T(\d+)\]", blk)
+        if m and f"T{int(m.group(1))}" in excluded:
+            continue
+        kept.append(blk)
+    return "\n\n".join(kept)
+
+
 def _q(quote: str, like: int = 0) -> str:
-    """引用原文（多行压成一行、去回复缩进）并转成引用块，
-    附抓取时刻的赞数供原评论区定位（0 赞也标注）。"""
+    """引用原文（多行压成一行）并转成引用块，附抓取时刻赞数供定位。"""
     if not quote:
         return ""
     one = " ".join(quote.split())
@@ -256,17 +266,22 @@ def _q(quote: str, like: int = 0) -> str:
     return f"\n> {one}（抓取时 {like} 赞）"
 
 
+# ────────────────────────── M6 报告渲染 ──────────────────────────
+
 def render_report(s: PipelineState) -> str:
-    """把各节点 JSON 结果组装成最终 Markdown 报告。"""
+    """八段式报告：概览 / 命题还原 / 观点地图 / 论辩关系 / 论证诊断 /
+    值得学习的论证 / 可疑事实 / 认知与社会观察。"""
     meta = s["meta"]
-    st = s.get("stance_map") or {}
-    au = s.get("autopsy") or {}
-    ins = s.get("insights") or {}
+    cl = s.get("claims") or {}
+    pm = s.get("position_map") or {}
+    dr = s.get("debate_relations") or {}
+    dg = s.get("diagnosis") or {}
     ba = s.get("best_args") or {}
     sf = s.get("suspect_facts") or {}
+    ins = s.get("insights") or {}
 
     L = []
-    L.append(f"# 评论区思辨报告\n")
+    L.append("# 评论区思辨报告\n")
     L.append(f"**视频**：{meta.get('title', '?')}")
     L.append(f"**链接**：https://www.bilibili.com/video/{meta.get('bvid', '')}")
     L.append(f"**分析范围**：热评前 {s.get('threads_total', '?')} 条主评论（含楼中楼）")
@@ -276,59 +291,128 @@ def render_report(s: PipelineState) -> str:
              "`T12_回复3` = 点开 T12 后楼中楼第 3 条（热度序）。"
              "抓取后热度会随点赞变化重排，位置对不上时，按引用旁的原文和"
              "「抓取时 N 赞」在评论区对照查找。\n")
-    L.append("> 本报告分析**论证质量**，不评判任何立场对错。评论一律匿名。\n")
+    L.append("> 本报告分析**论证质量与讨论结构**，不评判任何立场对错。"
+             "评论一律匿名，不分析评论者本人，不做评分榜。\n")
 
-    # ── 一、争论地图 ──
-    L.append("\n## 一、争论地图：这场争论到底在争什么\n")
-    L.append("### 立场阵营\n")
-    for i, stc in enumerate(st.get("stances", []), 1):
-        L.append(f"{i}. **{stc.get('name')}**（{stc.get('size', '?')} 条）：{stc.get('summary')}")
+    # ── 一、讨论概览 ──
+    claims = cl.get("claims") or []
+    non_arg = cl.get("non_argument_comments") or []
+    L.append("\n## 一、讨论概览\n")
+    L.append(f"本次分析从 {s.get('threads_total', '?')} 条主评论及其回复中，"
+             f"提取出 {len(claims)} 条有实质内容的命题，"
+             f"{len(non_arg)} 条被归为非论证表达（玩梗/提问/纯情绪）。")
+    L.append("样本说明：仅覆盖热评前若干条及其高赞回复链，不代表全部评论。\n")
+
+    # ── 二、命题还原 ──
+    L.append("\n## 二、命题还原：评论者到底提出了什么\n")
+    L.append("> 只还原命题，不评价对错。「隐含前提」是论证依赖但未明说的假设。\n")
+    shown = 0
+    for c in claims:
+        if shown >= 12:
+            break
+        L.append(f"- **[{c.get('claim_id')}]（{c.get('thread_id')}）** {c.get('main_claim')}")
+        types = c.get("claim_types") or []
+        if types:
+            L.append(f"  - 类型：{'、'.join(types)}")
+        for a in (c.get("implicit_assumptions") or [])[:2]:
+            L.append(f"  - 隐含前提〔{a.get('confidence', '?')}〕：{a.get('content')}")
+        for u in (c.get("uncertainties") or [])[:2]:
+            L.append(f"  - 不确定处：{u}")
+        shown += 1
+    if len(claims) > shown:
+        L.append(f"- ……（其余 {len(claims)-shown} 条命题见结构化数据）")
+
+    # ── 三、观点地图 ──
+    L.append("\n## 三、观点地图：真正的分歧在哪里\n")
+    L.append("### 观点簇\n")
+    for p in pm.get("positions", []):
+        L.append(f"- **{p.get('position_id')} · {p.get('name')}**：{p.get('core_claim')}")
+        for r in (p.get("main_reasons") or [])[:2]:
+            L.append(f"  - 主要理由：{r}")
+        for a in (p.get("key_assumptions") or [])[:2]:
+            L.append(f"  - 关键前提：{a}")
+        for v in (p.get("internal_variations") or [])[:2]:
+            L.append(f"  - 簇内分歧：{v}")
+    L.append("\n### 观点之间的关系\n")
+    for r in pm.get("relationships", []):
+        rel = {"conflict": "冲突", "partial_conflict": "部分冲突",
+               "apparent_conflict": "表面冲突（可能可兼容）",
+               "compatible": "可兼容"}.get(r.get("relationship"), r.get("relationship"))
+        L.append(f"- **{r.get('position_a')} ↔ {r.get('position_b')}**：{rel}。{r.get('reason')}")
     L.append("\n### 核心分歧\n")
-    disputes = st.get("core_disputes") or []
-    if disputes:
-        for d in disputes:
-            L.append(f"- **{d.get('question')}**〔{d.get('dimension')}〕")
-            for side in d.get("sides", []):
-                L.append(f"  - {side}")
-    else:
-        L.append("- 未识别出真正的命题冲突")
-    L.append('\n### 错位检测：谁在「各说各话」\n')
-    mm = st.get("mismatches") or []
-    if mm:
-        for m in mm:
-            L.append(f"- {m.get('description')}（相关：{', '.join(m.get('thread_ids', []))}）")
-    else:
-        L.append("- 未发现明显错位")
+    for d in pm.get("core_disputes", []):
+        L.append(f"- **{d.get('question')}**〔{d.get('dimension')}〕")
+        for side in d.get("sides", []):
+            L.append(f"  - {side}")
 
-    # ── 二、垃圾解剖 ──
-    L.append("\n## 二、垃圾解剖：烂论证烂在哪\n")
-    L.append("> 以下是评论中**高赞/高传播但论证质量低**的代表。注意：分析论证不评"
-             "立场；每条都标注了其中值得回应的内核。\n")
-    for item in au.get("items", []):
-        L.append(f"### 解剖对象 {item.get('thread_id')}"
-                 f"{_q(item.get('quote', ''), item.get('quote_like', 0))}\n")
-        layers = [
-            ("论据", item.get("evidence_problems")),
-            ("推理", item.get("reasoning_problems")),
-            ("情绪", item.get("emotion_problems")),
-            ("修辞", item.get("rhetoric_problems")),
-        ]
-        for name, probs in layers:
-            if probs:
-                L.append(f"- **{name}层**：" + "；".join(probs))
-        L.append(f"- **为什么有说服力**：{item.get('why_convincing')}")
-        L.append(f"- **值得回应的内核**：{item.get('kernel')}")
-        L.append(f"- **示范性回应**：{item.get('reply_demo')}\n")
+    # ── 四、论辩关系 ──
+    L.append("\n## 四、论辩关系：他们真的在互相回应吗\n")
+    rel_name = {
+        "direct_response": "直接回应", "partial_response": "部分回应",
+        "misunderstanding": "误解", "talking_past": "各说各话",
+        "topic_shift": "转移话题", "escalation": "升级对抗",
+        "productive_progress": "有效推进",
+    }
+    for r in (dr.get("debate_relations") or [])[:12]:
+        L.append(f"- **{r.get('target_comment_id')} → {r.get('source_comment_id')}**"
+                 f"〔{rel_name.get(r.get('relation_type'), r.get('relation_type'))}"
+                 f"，{r.get('confidence', '?')}〕")
+        L.append(f"  - 被回应的命题：{r.get('responded_to_claim')}")
+        L.append(f"  - 实际回应了：{r.get('actual_response')}")
+        L.append(f"  - 判定依据：{r.get('analysis')}")
+    L.append("\n### 反复出现的论辩模式\n")
+    for p in dr.get("debate_patterns", []):
+        L.append(f"- **{p.get('pattern')}**：{p.get('description')}"
+                 f"（代表：{', '.join(p.get('representative_threads', []))}）")
+    sm = dr.get("summary") or {}
+    if sm:
+        L.append("\n### 数据概览\n")
+        for k, label in [("direct_response_ratio", "直接回应"),
+                         ("talking_past_ratio", "各说各话"),
+                         ("misunderstanding_ratio", "误解"),
+                         ("escalation_ratio", "升级对抗"),
+                         ("productive_progress_ratio", "有效推进")]:
+            if sm.get(k):
+                L.append(f"- {label}：{sm[k]}")
+        if sm.get("data_limitations"):
+            L.append(f"- 数据局限：{sm['data_limitations']}")
 
-    # ── 三、最佳论证 ──
-    L.append("\n## 三、值得学习的论证范本\n")
+    # ── 五、论证诊断 ──
+    L.append("\n## 五、论证诊断：有问题的表达为什么有传播力\n")
+    L.append("> 诊断的是**论证过程**，不是评论者本人；论证质量低不等于没有"
+             "分析价值。每条都附带其中值得认真对待的问题。\n")
+    for it in dg.get("items", []):
+        L.append(f"### {it.get('thread_id')}{_q(it.get('quote', ''), it.get('quote_like', 0))}\n")
+        st = it.get("argument_structure") or {}
+        if st.get("conclusion"):
+            L.append(f"- **试图让人接受**：{st['conclusion']}")
+            for r in (st.get("reasons") or [])[:2]:
+                L.append(f"  - 理由：{r}")
+            if st.get("reasoning_path"):
+                L.append(f"  - 推理路径：{st['reasoning_path']}")
+        for d in it.get("diagnosis", []):
+            conf = f"〔{d.get('confidence', '?')}〕" if d.get("confidence") else ""
+            L.append(f"- **问题**{conf}：{d.get('observed_problem')}")
+            if d.get("possible_logical_issue"):
+                L.append(f"  - 可能的逻辑问题：{d['possible_logical_issue']}")
+        for w in (it.get("why_this_pattern_may_appear") or [])[:2]:
+            L.append(f"- **为什么常见**：{w}")
+        av = it.get("analytical_value") or {}
+        if av.get("valuable_question") and av.get("valuable_question") != "无":
+            L.append(f"- **值得认真对待的问题**〔{av.get('level', '?')}〕：{av.get('valuable_question')}")
+            if av.get("explanation"):
+                L.append(f"  - {av['explanation']}")
+        if it.get("better_response"):
+            L.append(f"- **示范性回应**：{it['better_response']}\n")
+
+    # ── 六、值得学习的论证 ──
+    L.append("\n## 六、值得学习的论证\n")
     for i, b in enumerate(ba.get("items", []), 1):
-        quote = _q(b.get("quote", ""), b.get("quote_like", 0))
-        L.append(f"{i}. **{b.get('thread_id')}**（{b.get('stance', '?')}）：{b.get('why_good')}"
-                 f"{quote}\n")
+        L.append(f"{i}. **{b.get('thread_id')}**（{b.get('stance', '?')}）："
+                 f"{b.get('why_good')}{_q(b.get('quote', ''), b.get('quote_like', 0))}\n")
 
-    # ── 四、可疑事实 ──
-    L.append("\n## 四、可疑事实清单（待核实，不代表证伪）\n")
+    # ── 七、可疑事实清单 ──
+    L.append("\n## 七、可疑事实清单（待核实，不代表证伪）\n")
     facts = sf.get("facts") or []
     if facts:
         for i, f in enumerate(facts, 1):
@@ -337,19 +421,17 @@ def render_report(s: PipelineState) -> str:
     else:
         L.append("- 无")
 
-    # ── 五、垃圾的社会学观察 ──
-    L.append("\n## 五、垃圾的社会学观察：低质评论在反映什么\n")
-    L.append("> 论证质量低 ≠ 信息价值低。把情绪、偏见、玩梗当社会认知的窗口来读。\n")
+    # ── 八、认知与社会观察 ──
+    L.append("\n## 八、认知与社会观察\n")
     for r in (ins.get("readings") or []):
         L.append(f"### {r.get('phenomenon')}")
         L.append(f"- **证据**：{r.get('evidence')}")
-        L.append(f"- **解读**：{r.get('reflection')}\n")
-
-    # ── 六、评论区没有解决的问题 ──
-    L.append("\n## 六、评论区没有解决的问题\n")
+        L.append(f"- **解读**：{r.get('reflection')}〔{r.get('confidence', '?')}〕\n")
+    L.append("\n### 评论区没有解决的问题\n")
     for q in (ins.get("open_questions") or []):
         L.append(f"- **{q.get('question')}**")
         L.append(f"  - 为什么难解决：{q.get('why_hard')}")
 
-    L.append("\n---\n*由评论透镜生成。报告只评论证不评人，请勿据此攻击任何评论者。*\n")
+    L.append("\n---\n*由评论透镜生成。报告分析讨论结构，不评判立场，不评价个人，"
+             "请勿据此攻击任何评论者。*\n")
     return "\n".join(L)
