@@ -34,6 +34,7 @@
   #report li { margin: .35em 0; }
   #report hr { border:0; border-top:1px solid var(--line); margin:2.2em 0; }
   .err { color: var(--accent); }
+  .warn { background: #fdf3e3; border-color: #d9a441; color: #7a5b12; }
 </style>
 </head>
 <body>
@@ -100,7 +101,7 @@ function poll(taskId) {
       $("status").textContent = t.message || t.status;
       if (t.status === "done") {
         clearInterval(pollTimer);
-        loadReport(taskId);
+        loadReport(taskId, t);
       } else if (t.status === "error") {
         clearInterval(pollTimer);
         $("status").className = "err";
@@ -110,11 +111,16 @@ function poll(taskId) {
   }, 2000);
 }
 
-async function loadReport(taskId) {
+async function loadReport(taskId, task) {
   const r = await fetch(`${API}/api/tasks/${taskId}/report`);
   const j = await r.json();
-  $("status").textContent = "完成 ✅（报告内容若更新过，请重新分析获取最新快照）";
-  $("status").className = "";
+  if (task && task.degraded) {
+    $("status").textContent = "完成 ✅ 注意：本次分析发生降级（命题提取输出超限，已自动降档或抢救），报告覆盖偏窄，建议重新分析一次。";
+    $("status").className = "warn";
+  } else {
+    $("status").textContent = "完成 ✅（报告内容若更新过，请重新分析获取最新快照）";
+    $("status").className = "";
+  }
   const report = $("report");
   report.style.display = "block";
   try {

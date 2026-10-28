@@ -1,8 +1,8 @@
 """pipeline.py — LangGraph 编排的分析管线（v2 内核）
 
 节点图（全串行单链，每节点仅一个直接前驱）：
-    prepare → extract_claims → position_map → debate_relations
-           → pick_diagnosis → argument_diagnosis → best_args
+    prepare → extract_claims → position_map → debate_relations → pick_diagnosis
+           → argument_diagnosis → nonargument_autopsy → best_args
            → suspect_facts → cognitive_insights → compose
 
 节点都是纯函数 (state: dict) -> dict，只写自己负责的字段。
@@ -33,13 +33,16 @@ class PipelineState(TypedDict, total=False):
     debate_relations: dict
     picks: list[dict]
     diagnosis: dict
+    nonargument: dict          # 非论证表达解剖（第六节）
     best_args: dict
     suspect_facts: dict
     insights: dict
+    timings: dict              # 各节点耗时（compose 写入，供运行日志落盘）
     report_md: str
 
 
 def make_graph(llm: DeepSeekClient):
+    timings: dict = {}   # 各节点耗时（compose 返回，供运行日志落盘）
     def prepare(state: PipelineState) -> dict:
         # 脱敏后的树结构（仅 like/text/replies），供引用与文本块组装
         def mini(node: dict) -> dict:
@@ -59,6 +62,7 @@ def make_graph(llm: DeepSeekClient):
     def extract_claims(state: PipelineState) -> dict:
         t0 = time.time()
         r = nodes.node_extract_claims(llm, state["corpus_text"])
+        timings["M1 命题提取"] = time.time()-t0
         print(f"  [M1 命题提取] {time.time()-t0:.1f}s "
               f"命题 {len(r.get('claims', []))} 条 / "
               f"非论证 {len(r.get('non_argument_comments', []))} 条")
@@ -68,6 +72,7 @@ def make_graph(llm: DeepSeekClient):
         t0 = time.time()
         r = nodes.node_position_map(llm, state.get("claims", {}).get("claims", []),
                                     state["corpus_text"])
+        timings["M2 观点地图"] = time.time()-t0
         print(f"  [M2 观点地图] {time.time()-t0:.1f}s "
               f"观点簇 {len(r.get('positions', []))} / "
               f"分歧 {len(r.get('core_disputes', []))}")
@@ -78,6 +83,7 @@ def make_graph(llm: DeepSeekClient):
         r = nodes.node_debate_relations(
             llm, state.get("claims", {}).get("claims", []),
             state.get("position_map", {}), state["corpus_text"])
+        timings["M3 论辩关系"] = time.time()-t0
         print(f"  [M3 论辩关系] {time.time()-t0:.1f}s "
               f"关系 {len(r.get('debate_relations', []))} 条 / "
               f"模式 {len(r.get('debate_patterns', []))}")
@@ -87,6 +93,7 @@ def make_graph(llm: DeepSeekClient):
         t0 = time.time()
         r = nodes.node_pick_diagnosis(llm, state["corpus_text"])
         picks = r.get("picks", [])
+        timings["M4a 诊断候选"] = time.time()-t0
         print(f"  [M4a 诊断候选] {time.time()-t0:.1f}s 选中 {len(picks)} 处")
         return {"picks": picks}
 
@@ -122,8 +129,39 @@ def make_graph(llm: DeepSeekClient):
         for it in r.get("items", []):
             it["quote"], it["quote_like"] = _resolve_quote(
                 state, it.get("thread_id", ""))
+        timings["M4b 论证诊断"] = time.time()-t0
         print(f"  [M4b 论证诊断] {time.time()-t0:.1f}s 诊断 {len(r.get('items', []))} 处")
         return {"diagnosis": r}
+
+    def nonargument_autopsy(state: PipelineState) -> dict:
+        """非论证表达解剖：玩梗/情绪/提问在争论里实际起了什么作用。
+
+        素材来自命题提取给出的非论证索引；编号统一走 _resolve_quote 解析，
+        解析不到的编号直接丢弃——模型写错编号也不能让报告出现指不到原文的引用。
+        """
+        idx = (state.get("claims") or {}).get("non_argument_comments") or []
+        items = []
+        for nc in idx:
+            tid = nc.get("thread_id", "")
+            text, like = _resolve_quote(state, tid)
+            if text:
+                items.append((tid, text, like))
+        if not items:
+            print("  [M5b 非论证解剖] 无非论证表达，跳过")
+            return {"nonargument": {"clusters": [], "summary": {}}}
+        t0 = time.time()
+        r = nodes.node_nonargument_autopsy(llm, items)
+        # 素材披露：模型登记的条数 vs 真正能读到正文的条数
+        # （纯 "@某人" 之类的回复剥离前缀后没有正文，只能跳过——不说清楚，
+        #   读者会把 4 条素材得出的结论当成 30 条的结论）
+        r["material"] = {"indexed": len(idx), "used": len(items)}
+        for c in r.get("clusters", []):
+            c["thread_ids"] = [x for x in (c.get("thread_ids") or [])
+                               if _resolve_quote(state, x)[0]]
+        timings["M5b 非论证解剖"] = time.time()-t0
+        print(f"  [M5b 非论证解剖] {time.time()-t0:.1f}s "
+              f"聚类 {len(r.get('clusters', []))} 个 / 素材 {len(items)} 条")
+        return {"nonargument": r}
 
     def best_args(state: PipelineState) -> dict:
         # 排除诊断过的主楼（N6 串行在诊断后）。双保险：
@@ -138,12 +176,14 @@ def make_graph(llm: DeepSeekClient):
         for it in r.get("items", []):
             it["quote"], it["quote_like"] = _resolve_quote(
                 state, it.get("thread_id", ""))
+        timings["M6 最佳论证"] = time.time()-t0
         print(f"  [M6 最佳论证] {time.time()-t0:.1f}s 范本 {len(r.get('items', []))} 条")
         return {"best_args": r}
 
     def suspect_facts(state: PipelineState) -> dict:
         t0 = time.time()
         r = nodes.node_suspect_facts(llm, state["corpus_text"])
+        timings["M7 可疑事实"] = time.time()-t0
         print(f"  [M7 可疑事实] {time.time()-t0:.1f}s 断言 {len(r.get('facts', []))} 条")
         return {"suspect_facts": r}
 
@@ -155,13 +195,14 @@ def make_graph(llm: DeepSeekClient):
             state.get("position_map", {}),
             state.get("debate_relations", {}),
             (state.get("diagnosis") or {}).get("items", []))
+        timings["M5 认知观察"] = time.time()-t0
         print(f"  [M5 认知观察] {time.time()-t0:.1f}s "
               f"观察 {len(r.get('readings', []))} 条 / "
               f"开放问题 {len(r.get('open_questions', []))} 个")
         return {"insights": r}
 
     def compose(state: PipelineState) -> dict:
-        return {"report_md": render_report(state)}
+        return {"report_md": render_report(state), "timings": timings}
 
     g = StateGraph(PipelineState)
     g.add_node("prepare", prepare)
@@ -170,6 +211,7 @@ def make_graph(llm: DeepSeekClient):
     g.add_node("debate_relations", debate_relations)
     g.add_node("pick_diagnosis", pick_diagnosis)
     g.add_node("argument_diagnosis", argument_diagnosis)
+    g.add_node("nonargument_autopsy", nonargument_autopsy)
     g.add_node("best_args", best_args)
     g.add_node("suspect_facts", suspect_facts)
     g.add_node("cognitive_insights", cognitive_insights)
@@ -184,7 +226,8 @@ def make_graph(llm: DeepSeekClient):
     g.add_edge("position_map", "debate_relations")
     g.add_edge("debate_relations", "pick_diagnosis")
     g.add_edge("pick_diagnosis", "argument_diagnosis")
-    g.add_edge("argument_diagnosis", "best_args")
+    g.add_edge("argument_diagnosis", "nonargument_autopsy")
+    g.add_edge("nonargument_autopsy", "best_args")
     g.add_edge("best_args", "suspect_facts")
     g.add_edge("suspect_facts", "cognitive_insights")
     g.add_edge("cognitive_insights", "compose")
@@ -269,13 +312,14 @@ def _q(quote: str, like: int = 0) -> str:
 # ────────────────────────── M6 报告渲染 ──────────────────────────
 
 def render_report(s: PipelineState) -> str:
-    """八段式报告：概览 / 命题还原 / 观点地图 / 论辩关系 / 论证诊断 /
-    值得学习的论证 / 可疑事实 / 认知与社会观察。"""
+    """九段式报告：概览 / 命题还原 / 观点地图 / 论辩关系 / 论证诊断 /
+    非论证表达解剖 / 值得学习的论证 / 可疑事实 / 认知与社会观察。"""
     meta = s["meta"]
     cl = s.get("claims") or {}
     pm = s.get("position_map") or {}
     dr = s.get("debate_relations") or {}
     dg = s.get("diagnosis") or {}
+    na = s.get("nonargument") or {}
     ba = s.get("best_args") or {}
     sf = s.get("suspect_facts") or {}
     ins = s.get("insights") or {}
@@ -300,7 +344,8 @@ def render_report(s: PipelineState) -> str:
     L.append("\n## 一、讨论概览\n")
     L.append(f"本次分析从 {s.get('threads_total', '?')} 条主评论及其回复中，"
              f"提取出 {len(claims)} 条有实质内容的命题，"
-             f"{len(non_arg)} 条被归为非论证表达（玩梗/提问/纯情绪）。")
+             f"{len(non_arg)} 条被归为非论证表达（玩梗/提问/纯情绪）"
+             f"——它们的解剖见第六节。")
     L.append("样本说明：仅覆盖热评前若干条及其高赞回复链，不代表全部评论。\n")
 
     # ── 二、命题还原 ──
@@ -405,14 +450,48 @@ def render_report(s: PipelineState) -> str:
         if it.get("better_response"):
             L.append(f"- **示范性回应**：{it['better_response']}\n")
 
-    # ── 六、值得学习的论证 ──
-    L.append("\n## 六、值得学习的论证\n")
+    # ── 六、非论证表达解剖 ──
+    L.append("\n## 六、非论证表达解剖：玩梗、情绪与提问在做什么\n")
+    L.append("> 这些表达没有被丢掉，也不等于论证缺陷。解剖它们是为了看清它们在争论里"
+             "实际承担了什么工作（有时比正经论证更有效），以及其中有没有被埋掉的真问题。\n")
+    clusters = na.get("clusters") or []
+    if clusters:
+        for c in clusters:
+            kinds = "、".join(c.get("kinds") or []) or "未标注"
+            L.append(f"- **{c.get('label')}**〔{kinds}，{c.get('confidence', '?')}〕")
+            if c.get("literal_reading"):
+                L.append(f"  - 字面：{c['literal_reading']}")
+            if c.get("what_it_does"):
+                L.append(f"  - 在争论里：{c['what_it_does']}")
+            kernel = (c.get("argument_kernel") or "").strip()
+            if kernel and kernel != "无":
+                L.append(f"  - 值得认真对待的内核：{kernel}")
+            else:
+                L.append("  - 值得认真对待的内核：无（已确认过，不是没找）")
+            if c.get("thread_ids"):
+                L.append(f"  - 出现于：{', '.join(c['thread_ids'])}")
+        mat = na.get("material") or {}
+        if mat.get("used") is not None:
+            idx_n, used_n = mat.get("indexed", 0), mat.get("used", 0)
+            extra = "（其余无正文或编号无效，已跳过）" if idx_n > used_n else ""
+            L.append(f"\n- 解剖素材：{used_n} 条" +
+                     (f"，命题提取共登记 {idx_n} 条{extra}" if idx_n > used_n else ""))
+        sm2 = na.get("summary") or {}
+        if sm2.get("share_of_sample"):
+            L.append(f"\n- 占比：{sm2['share_of_sample']}")
+        if sm2.get("data_limitations"):
+            L.append(f"- 数据局限：{sm2['data_limitations']}")
+    else:
+        L.append("- 本次样本里没有可归类的非论证表达。")
+
+    # ── 七、值得学习的论证 ──
+    L.append("\n## 七、值得学习的论证\n")
     for i, b in enumerate(ba.get("items", []), 1):
         L.append(f"{i}. **{b.get('thread_id')}**（{b.get('stance', '?')}）："
                  f"{b.get('why_good')}{_q(b.get('quote', ''), b.get('quote_like', 0))}\n")
 
-    # ── 七、可疑事实清单 ──
-    L.append("\n## 七、可疑事实清单（待核实，不代表证伪）\n")
+    # ── 八、可疑事实清单 ──
+    L.append("\n## 八、可疑事实清单（待核实，不代表证伪）\n")
     facts = sf.get("facts") or []
     if facts:
         for i, f in enumerate(facts, 1):
@@ -421,8 +500,8 @@ def render_report(s: PipelineState) -> str:
     else:
         L.append("- 无")
 
-    # ── 八、认知与社会观察 ──
-    L.append("\n## 八、认知与社会观察\n")
+    # ── 九、认知与社会观察 ──
+    L.append("\n## 九、认知与社会观察\n")
     for r in (ins.get("readings") or []):
         L.append(f"### {r.get('phenomenon')}")
         L.append(f"- **证据**：{r.get('evidence')}")

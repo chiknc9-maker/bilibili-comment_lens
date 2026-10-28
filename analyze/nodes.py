@@ -1,5 +1,5 @@
-"""nodes.py — M3 分析节点（v2 内核）：命题提取 / 观点地图 / 论辩关系 /
-论证诊断 / 认知与社会观察 / 辅助节点（最佳论证、可疑事实）
+"""nodes.py — M3 分析节点（v2 内核）：命题提取 / 非论证解剖 / 观点地图 /
+论辩关系 / 论证诊断 / 认知与社会观察 / 辅助节点（最佳论证、可疑事实）
 
 每个节点是纯函数 (ctx...) -> dict，只负责自己的字段。
 
@@ -14,6 +14,11 @@
 from __future__ import annotations
 
 import json
+
+from .llm import LLMTruncatedError, salvage_partial_json
+
+NON_ARG_LIMIT = 30            # 非论证评论只做索引，最多登记多少条
+CLAIM_TIERS = (50, 30, 20)    # 命题提取的降档阶梯（被截断时逐级下调）
 
 SYSTEM_CORE = """你是一名网络评论分析员，正在分析一个B站争议视频的评论区。
 铁律：
@@ -30,13 +35,9 @@ SYSTEM_CORE = """你是一名网络评论分析员，正在分析一个B站争�
 
 # ────────────────────────── M1 命题提取器 ──────────────────────────
 
-def node_extract_claims(llm, corpus_text: str, max_claims: int = 50) -> dict:
-    """M1：从评论中提取命题（claims）。只还原命题，不评价对错。
-
-    输出规模受控：聚焦有实质论证或立场表达的评论，最多 max_claims 条；
-    无明确命题的评论（纯玩梗/灌水/纯提问）不生成 claim 条目。
-    """
-    system = SYSTEM_CORE + """
+def _claims_system(max_claims: int) -> str:
+    """命题提取的系统提示词（命题上限随降档变化）。"""
+    return SYSTEM_CORE + """
 执行"命题提取"：把评论还原为它们实际提出的命题。这是后续所有分析的基础，
 所以只做还原、绝不评价。
 
@@ -57,8 +58,7 @@ def node_extract_claims(llm, corpus_text: str, max_claims: int = 50) -> dict:
     }
   ],
   "non_argument_comments": [
-    {"thread_id": "T7", "kind": "playful_meme/question/emotion_only/other",
-     "note": "一句话说明为何归为非论证"}
+    {"thread_id": "T7", "kind": "playful_meme/irony/question/emotion_only/one_liner/other"}
   ]
 }
 
@@ -66,12 +66,53 @@ def node_extract_claims(llm, corpus_text: str, max_claims: int = 50) -> dict:
 - 严格区分三层：文本明确表达的 / 从文本合理推断的（进 implicit_assumptions）/
   无法确定的（不写）。绝不推测评论者身份、心理、真实动机。
 - 不贴政治或意识形态标签。
-- 玩梗、反讽的表达：标注其字面命题的同时，在 uncertainties 里注明
-  "疑似反讽/圈子梗，真实立场无法确定"。
-- claims 最多 """ + str(max_claims) + """ 条，优先提取有实质论证的；
-  其余归入 non_argument_comments（也控制在 30 条内）。"""
-    return llm.chat_json(system, f"评论区内容：\n\n{corpus_text}",
-                         max_tokens=8000)
+- 玩梗、反讽的表达：能还原字面命题的就还原，并在 uncertainties 里注明
+  "疑似反讽/圈子梗，真实立场无法确定"；无法还原的登记进 non_argument_comments。
+- claims 最多 """ + str(max_claims) + """ 条，优先提取有实质论证的。
+- non_argument_comments 只登记 **thread_id 与 kind**，不要写说明文字
+  （它们由后续"非论证解剖"节点专门分析），最多 """ + str(NON_ARG_LIMIT) + """ 条，
+  超出部分不要再列。"""
+
+
+def node_extract_claims(llm, corpus_text: str, max_claims: int = 50) -> dict:
+    """M1：从评论中提取命题（claims）。只还原命题，不评价对错。
+
+    为什么要三级降档：50 条命题（含隐含前提）的输出本身就要 6.7k~8k tokens，
+    正好卡在 max_tokens=8000 的边界上，一旦被截断就整跑失败；而"原样重试"
+    对这类失败几乎没有收益。所以逐级下调命题上限（50 → 30 → 20），全部失败
+    才用抢救（salvage）把已完整的条目捞回来，保证管线不因一个节点白跑。
+
+    non_argument_comments 只做**索引**（thread_id + kind），不写说明：
+    它是下一个节点"非论证解剖"的输入清单。这样既省掉大段 token（截断的主因
+    之一），也让玩梗/情绪/提问不再被一句 note 打发掉。
+    """
+    tiers = [max_claims] + [n for n in CLAIM_TIERS if n < max_claims]
+    trunc = None
+    for tier in tiers:
+        try:
+            r = llm.chat_json(_claims_system(tier),
+                              f"评论区内容：\n\n{corpus_text}", max_tokens=8000)
+        except LLMTruncatedError as e:
+            trunc = e
+            print(f"    （命题上限 {tier} 条仍被截断，降档重试…）")
+            continue
+        r["claims"] = (r.get("claims") or [])[:tier]
+        r["non_argument_comments"] = (r.get("non_argument_comments") or [])[:NON_ARG_LIMIT]
+        r["claim_tier"] = tier          # 实际生效的命题上限（供运行日志/前端提示）
+        if tier != tiers[0]:
+            r["degraded"] = True        # 降档＝覆盖变窄，必须在数据里留痕
+            print(f"    （已降档：命题上限 {tiers[0]} → {tier} 条）")
+        return r
+
+    salvaged = salvage_partial_json(trunc.raw) if trunc else {}
+    claims = salvaged.get("claims") or []
+    if claims:
+        print(f"    （降档全部失败，抢救出 {len(claims)} 条完整命题——"
+              f"本节覆盖会偏窄，建议重跑）")
+        return {"claims": claims[:max_claims],
+                "non_argument_comments": (salvaged.get("non_argument_comments") or [])[:NON_ARG_LIMIT],
+                "degraded": True}
+    raise trunc
 
 
 def claims_brief(claims: list[dict], limit: int = 50) -> str:
@@ -85,6 +126,58 @@ def claims_brief(claims: list[dict], limit: int = 50) -> str:
                         for a in (c.get("implicit_assumptions") or [])][:2],
     } for c in (claims or [])[:limit]]
     return json.dumps(brief, ensure_ascii=False)
+
+
+# ────────────────────────── 非论证表达解剖 ──────────────────────────
+
+def node_nonargument_autopsy(llm, items: list[tuple[str, str, int]],
+                             max_clusters: int = 6) -> dict:
+    """玩梗 / 反讽 / 情绪 / 提问 / 一句话 在争论里实际起了什么作用。
+
+    产品主张（写进提示词）：这些表达不该被过滤掉。它们常常承担着正经论证没能
+    承担的工作——情绪可以是有效的修辞指控，玩梗可以是压缩版的论证，提问可能
+    指向全场都没回答的真问题。但也不许为了显得深刻而硬找价值：确实没有内核的
+    必须写"无"，这是报告可信度的底线。
+
+    输入是命题提取给出的非论证索引（thread_id）解析出的原文，最多 NON_ARG_LIMIT 条；
+    输出按模式聚成不超过 max_clusters 个簇，输出量有界，不会像逐条罗列那样
+    顶到 max_tokens。
+    """
+    ask = "\n".join(f"[{tid}]（{like}赞）{text}" for tid, text, like in items)
+    system = SYSTEM_CORE + """
+执行"非论证表达解剖"。下面给出的是评论区的非论证表达（玩梗、反讽、纯情绪、
+纯提问、一句话等）。传统做法是把这类表达当噪音过滤掉；本项目不这么做——它们
+往往承担着正经论证没能承担的工作。你的任务是说清**它们在争论里实际起了什么作用**。
+
+要求：
+- 先按模式聚类，最多 """ + str(max_clusters) + """ 个簇，不要逐条罗列；
+  每个簇用一句中性命名（如"用夸张类比把对方论证压成荒谬图像"），不褒不贬。
+- 每个簇先给"字面在说什么"，再给"在争论里起了什么作用"，不许跳过字面直接升华。
+- argument_kernel 是其中值得认真对待的主张或问题；**确实没有的必须写"无"**，
+  不许为了显得深刻而硬找价值——"没有内核"是常见且正常的结论。
+- 拿不准是不是梗/反讽的，confidence 给 low，并在 what_it_does 里如实写明
+  "含义未能确认"，不要自信地给字面解读。
+- 不评价评论者本人（身份、动机、智力、立场对错），只谈表达在讨论中的功能。
+- thread_ids 只能取自下面给出的编号，不要编造编号。
+输出 JSON：
+{
+  "clusters": [
+    {
+      "label": "中性命名",
+      "kinds": ["playful_meme/irony/emotion/question/one_liner/other 中选，可多选"],
+      "thread_ids": ["T7", "T12_回复3"],
+      "literal_reading": "字面在说什么（一句话）",
+      "what_it_does": "在争论里实际起的作用（描述性，40~80 字）",
+      "argument_kernel": "其中值得认真对待的主张或问题；没有就写'无'",
+      "confidence": "high/medium/low"
+    }
+  ],
+  "summary": {
+    "share_of_sample": "非论证表达在样本里的占比，只能给'多数/约一半/少数/样本不足'",
+    "data_limitations": "样本与解读局限（一句话）"
+  }
+}"""
+    return llm.chat_json(system, "待解剖的非论证表达：\n\n" + ask, max_tokens=4000)
 
 
 # ────────────────────────── M2 观点地图构建器 ──────────────────────────

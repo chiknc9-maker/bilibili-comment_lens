@@ -1,4 +1,4 @@
-# 密钥与本地配置（绝不入库）
+﻿# 密钥与本地配置（绝不入库）
 .env
 
 # Python
@@ -9,3 +9,14 @@ __pycache__/
 # 抓取与分析产物（可重新生成）
 data/
 reports/
+
+# Python 其它
+venv/
+*.pyo
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+.pytest_cache/
+.DS_Store
+Thumbs.db

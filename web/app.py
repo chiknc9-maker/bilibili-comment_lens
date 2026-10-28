@@ -8,8 +8,10 @@
 """
 from __future__ import annotations
 
+import json
 import sys
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -50,28 +52,74 @@ def _set_status(task_id: str, **fields):
         _tasks[task_id].update(fields)
 
 
-def _run_task(task_id: str, bvid: str):
+MAX_ATTEMPTS = 3
+FETCH_RETRY_DELAYS = [90, 180]    # 抓取失败（风控/网络）需要冷却，等久一点
+ANALYSIS_RETRY_DELAYS = [15, 30]  # 分析失败很快能再试（本地缓存让重试几乎免费）
+
+
+def _retryable(e: BaseException) -> bool:
+    """哪些失败值得自动重试：缺 key / 鉴权失败 / 非法输入是确定性的，不重试。"""
+    msg = str(e)
+    if "DEEPSEEK_API_KEY" in msg or "'401" in msg or "'403" in msg:
+        return False
+    if isinstance(e, ValueError):
+        return False
+    return True
+
+
+def _fetch_and_save(bvid: str) -> Path:
+    """抓取并落盘。fetch 内部用 SystemExit 表达风控中断，
+    转成普通异常，否则这里会漏捕、任务永远卡在抓取中。"""
     try:
-        _set_status(task_id, status="fetching",
-                    message="正在抓取评论区（含深树对话，约 1~5 分钟）…")
         data = fc.fetch_video(bvid, main_total=100, delay=0.35)
+    except SystemExit as e:
+        raise RuntimeError(f"抓取被中断：{e}") from e
+    DATA_DIR.mkdir(exist_ok=True)
+    json_path = DATA_DIR / f"{bvid}_comments.json"
+    json_path.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                         encoding="utf-8")
+    return json_path
 
-        DATA_DIR.mkdir(exist_ok=True)
-        json_path = DATA_DIR / f"{bvid}_comments.json"
-        json_path.write_text(
-            __import__("json").dumps(data, ensure_ascii=False, indent=1),
-            encoding="utf-8")
 
-        _set_status(task_id, status="analyzing",
-                    message="正在分析（立场地图 / 垃圾解剖 / 社会学观察，约 30~60 秒）…")
-        result = ra.analyze_comments(json_path)
-        ra.save_report(result, REPORT_DIR)
+def _run_task(task_id: str, bvid: str):
+    """后台执行一个分析任务；失败自动重试（最多 MAX_ATTEMPTS 次）。
 
-        _set_status(task_id, status="done", message="完成",
-                    report_md=result.get("report_md", ""),
-                    title=(result.get("meta") or {}).get("title", bvid))
-    except Exception as e:  # 后台线程兜底：任何失败都转为任务错误
-        _set_status(task_id, status="error", message=f"失败：{e}")
+    抓取失败（B站风控/网络）与中途分析失败都会重试，风控类等待更久；
+    确定性错误（缺 key、鉴权失败）不重试，直接报错并给出原因。
+    """
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        stage = "fetch"
+        try:
+            _set_status(task_id, status="fetching",
+                        message="正在抓取评论区（含深树对话，约 1~5 分钟）…")
+            json_path = _fetch_and_save(bvid)
+            stage = "analysis"
+
+            _set_status(task_id, status="analyzing",
+                        message="正在分析（命题还原 / 观点地图 / 论辩关系 / 论证诊断 / "
+                                "非论证解剖…，约 1~3 分钟）…")
+            result = ra.analyze_comments(json_path)
+            ra.save_report(result, REPORT_DIR)
+
+            claims_meta = result.get("claims") or {}
+            tier = claims_meta.get("claim_tier", 50)
+            _set_status(task_id, status="done", message="完成",
+                        report_md=result.get("report_md", ""),
+                        title=(result.get("meta") or {}).get("title", bvid),
+                        degraded=bool(claims_meta.get("degraded")) or tier < 50,
+                        claim_tier=tier)
+            return
+        except BaseException as e:  # 含 SystemExit：任何中断都转为任务状态，绝不悬挂
+            if attempt >= MAX_ATTEMPTS or not _retryable(e):
+                _set_status(task_id, status="error",
+                            message=f"失败（第 {attempt}/{MAX_ATTEMPTS} 次尝试）：{e}")
+                return
+            delays = FETCH_RETRY_DELAYS if stage == "fetch" else ANALYSIS_RETRY_DELAYS
+            wait = delays[attempt - 1]
+            _set_status(task_id, status="retrying",
+                        message=f"第 {attempt}/{MAX_ATTEMPTS} 次失败：{str(e)[:120]}；"
+                                f"{wait} 秒后自动重试…")
+            time.sleep(wait)
 
 
 @app.post("/api/analyze")
@@ -97,7 +145,9 @@ def get_task(task_id: str):
             "status": t.get("status"),
             "message": t.get("message", ""),
             "title": t.get("title"),
-            "has_report": "report_md" in t}
+            "has_report": "report_md" in t,
+            "degraded": bool(t.get("degraded")),
+            "claim_tier": t.get("claim_tier")}
 
 
 @app.get("/api/tasks/{task_id}/report")
