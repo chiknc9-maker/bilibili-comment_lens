@@ -42,7 +42,7 @@ comment-lens/
 
 ```powershell
 # 0) 克隆并建虚拟环境（首次）
-git clone <仓库地址> comment-lens
+git clone https://github.com/chiknc9-maker/bilibili-comment_lens.git comment-lens
 cd comment-lens
 python -m venv .venv        # Windows 之后用 .venv\Scripts\python.exe；macOS/Linux 用 .venv/bin/python
 
