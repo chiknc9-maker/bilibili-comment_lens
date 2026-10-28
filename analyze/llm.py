@@ -18,7 +18,15 @@ from pathlib import Path
 import httpx
 from dotenv import dotenv_values
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+def _app_dir() -> Path:
+    """运行基目录：打包后取 exe 所在目录（数据/缓存写在旁边），开发时取项目根。"""
+    import sys
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+PROJECT_ROOT = _app_dir()
 ENV = dotenv_values(PROJECT_ROOT / ".env")
 CACHE_DIR = PROJECT_ROOT / "data" / "llm_cache"   # 本地 LLM 缓存目录（已 gitignore）
 
@@ -108,16 +116,25 @@ class LLMTruncatedError(LLMError):
 
 
 class DeepSeekClient:
-    def __init__(self, cache_enabled: bool | None = None):
-        api_key = ENV.get("DEEPSEEK_API_KEY", "").strip()
+    """OpenAI 兼容协议的 LLM 客户端（默认 DeepSeek，可换任意兼容服务）。"""
+
+    def __init__(self, cache_enabled: bool | None = None,
+                 api_key: str | None = None, base_url: str | None = None,
+                 model: str | None = None, price_in: float | None = None,
+                 price_out: float | None = None):
+        api_key = (api_key or ENV.get("DEEPSEEK_API_KEY", "") or "").strip()
         if not api_key:
             raise LLMError(
-                "未找到 DEEPSEEK_API_KEY：请复制 .env.example 为 .env，"
-                "填入 platform.deepseek.com 申请的 API key（只存在本地）"
+                "未找到 API key：请复制 .env.example 为 .env 填入，"
+                "或在网页版的高级设置里填写自己的 key"
             )
         self.api_key = api_key
-        self.base_url = ENV.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
-        self.model = ENV.get("DEEPSEEK_MODEL", "deepseek-chat")
+        self.base_url = (base_url or ENV.get("DEEPSEEK_BASE_URL",
+                                             "https://api.deepseek.com")).rstrip("/")
+        self.model = model or ENV.get("DEEPSEEK_MODEL", "deepseek-chat")
+        # 成本估算价格（元/百万 token），供运行日志；不同服务价格不同
+        self.price_in = price_in if price_in is not None else float(ENV.get("PRICE_PER_M_IN", "2.0"))
+        self.price_out = price_out if price_out is not None else float(ENV.get("PRICE_PER_M_OUT", "8.0"))
         self.client = httpx.Client(
             base_url=self.base_url,
             headers={"Authorization": f"Bearer {api_key}"},
@@ -226,6 +243,14 @@ class DeepSeekClient:
                 raise
             except (httpx.HTTPError, KeyError, IndexError, json.JSONDecodeError) as e:
                 last_err = e
+                # 个别 OpenAI 兼容服务不支持 JSON mode：去掉该参数再试一次
+                # （系统提示词已强约束输出 JSON，去掉后通常仍返回 JSON）
+                if ("response_format" in payload
+                        and isinstance(e, httpx.HTTPStatusError)
+                        and e.response.status_code == 400):
+                    payload.pop("response_format", None)
+                    print("    （服务不支持 JSON mode，去掉该参数重试）")
+                    continue
                 time.sleep(1.5 * (attempt + 1))
         raise LLMError(f"模型调用失败（重试 {retries} 次）: {last_err}")
 

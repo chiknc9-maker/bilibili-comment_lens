@@ -59,6 +59,16 @@ python -m venv .venv        # Windows 之后用 .venv\Scripts\python.exe；macOS
 .venv\Scripts\python.exe -m uvicorn web.app:app --port 8000                 # M2 → http://127.0.0.1:8000/
 ```
 
+## 免安装打包版（Windows）
+
+不懂命令行？从 GitHub Releases 下载 `comment-lens.zip`，解压后双击 `comment-lens.exe`：
+浏览器会自动打开本地页面，粘贴 B站链接即可，数据与报告写在 exe 旁边（`data/`、`reports/`），
+关闭黑窗口即停止服务。
+
+**两个前提**：① 需要你自己的 API key——DeepSeek 或任何 OpenAI 兼容服务（通义/Kimi/GLM/
+SiliconFlow/Ollama）都行，在页面"高级设置"里粘贴一次就会被浏览器记住（只存在你自己的浏览器里）；
+② 个别杀毒软件会误报 PyInstaller 打包的程序，添加信任即可。
+
 ## M0 抓取：BV 号 → 评论 JSON
 
 ```powershell
@@ -85,6 +95,10 @@ python -m venv .venv        # Windows 之后用 .venv\Scripts\python.exe；macOS
 .venv\Scripts\python.exe run_analysis.py data/BV1roE9zUEF5_comments.json --dry-run   # 只算语料规模与预算，不调模型
 .venv\Scripts\python.exe run_analysis.py data/BV1roE9zUEF5_comments.json --out reports
 ```
+
+**换模型**：分析走 OpenAI 兼容协议，改 `.env` 里 `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` 两个值即可
+换成通义、Kimi、GLM、SiliconFlow、Ollama（本地模型）等；网页版在"高级设置"里直接填。
+个别服务不支持 JSON 输出模式时，客户端会自动去掉该参数重试。
 
 输出两个文件到 `reports/`（文件名取自视频 BV 号）：
 

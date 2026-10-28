@@ -20,3 +20,6 @@ venv/
 .pytest_cache/
 .DS_Store
 Thumbs.db
+# PyInstaller 打包产物
+build/
+dist/

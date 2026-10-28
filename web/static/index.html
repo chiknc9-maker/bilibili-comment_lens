@@ -50,6 +50,16 @@
   </div>
   <div class="hint">分析约需 2~6 分钟（抓取评论区 + AI 分析）。推荐直接访问 <b>http://127.0.0.1:8000/</b> 使用；双击文件打开也能用。</div>
 
+  <details style="margin-top:12px; font-size:.85rem; color:var(--sub);">
+    <summary style="cursor:pointer;">高级设置：填写自己的 API Key / 换模型（可选）</summary>
+    <div style="display:flex; flex-direction:column; gap:8px; margin-top:10px;">
+      <input id="api_key" type="password" placeholder="API Key（sk-…；不填则用本机 .env 配置）" autocomplete="off">
+      <input id="base_url" placeholder="API 地址（默认 https://api.deepseek.com，OpenAI 兼容服务可换）">
+      <input id="model" placeholder="模型名（默认 deepseek-chat）">
+      <p class="hint" style="margin:0;">Key 只保存在你自己的浏览器里，随每次请求发给本机服务，不上传任何第三方。</p>
+    </div>
+  </details>
+
   <div id="status"></div>
   <div id="report"></div>
 </div>
@@ -58,11 +68,24 @@
 const $ = id => document.getElementById(id);
 let pollTimer = null;
 // 绝对地址：即使页面是直接双击打开（file://），请求也能到达本机服务
-const API = "http://127.0.0.1:8000";
+// 页面由本服务打开时用同源地址；双击文件打开时回退到固定端口
+const API = location.protocol === "file:" ? "http://127.0.0.1:8000" : location.origin;
+// 记住上次填写的配置（只存在本浏览器里）
+$("api_key").value = localStorage.getItem("cl_api_key") || "";
+$("base_url").value = localStorage.getItem("cl_base_url") || "";
+$("model").value = localStorage.getItem("cl_model") || "";
 
 $("go").onclick = async () => {
   const url = $("url").value.trim();
   if (!url) return;
+  const body = { url };
+  const key = $("api_key").value.trim(), base = $("base_url").value.trim(), model = $("model").value.trim();
+  if (key) body.api_key = key;
+  if (base) body.base_url = base;
+  if (model) body.model = model;
+  localStorage.setItem("cl_api_key", key);
+  localStorage.setItem("cl_base_url", base);
+  localStorage.setItem("cl_model", model);
   $("go").disabled = true;
   $("report").style.display = "none";
   $("status").style.display = "block";
@@ -72,7 +95,7 @@ $("go").onclick = async () => {
     const r = await fetch(API + "/api/analyze", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url }),
+      body: JSON.stringify(body),
     });
     if (!r.ok) {
       const j = await r.json().catch(() => ({}));

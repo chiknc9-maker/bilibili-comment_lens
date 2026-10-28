@@ -20,7 +20,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+def _app_dir() -> Path:
+    """打包后取 exe 所在目录（数据/报告写在旁边），开发时取项目根。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+PROJECT_ROOT = _app_dir()
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import fetch_comments as fc        # noqa: E402
@@ -45,6 +52,13 @@ REPORT_DIR = PROJECT_ROOT / "reports"
 
 class AnalyzeRequest(BaseModel):
     url: str
+    # 可选：用户自带模型配置（不填则用本机 .env 的默认配置）。
+    # api_key 只在本进程内存中使用，绝不写入任务状态或日志。
+    api_key: str | None = None
+    base_url: str | None = None
+    model: str | None = None
+    price_in: float | None = None
+    price_out: float | None = None
 
 
 def _set_status(task_id: str, **fields):
@@ -81,7 +95,7 @@ def _fetch_and_save(bvid: str) -> Path:
     return json_path
 
 
-def _run_task(task_id: str, bvid: str):
+def _run_task(task_id: str, bvid: str, cfg: dict | None = None):
     """后台执行一个分析任务；失败自动重试（最多 MAX_ATTEMPTS 次）。
 
     抓取失败（B站风控/网络）与中途分析失败都会重试，风控类等待更久；
@@ -98,7 +112,7 @@ def _run_task(task_id: str, bvid: str):
             _set_status(task_id, status="analyzing",
                         message="正在分析（命题还原 / 观点地图 / 论辩关系 / 论证诊断 / "
                                 "非论证解剖…，约 1~3 分钟）…")
-            result = ra.analyze_comments(json_path)
+            result = ra.analyze_comments(json_path, llm_config=cfg)
             ra.save_report(result, REPORT_DIR)
 
             claims_meta = result.get("claims") or {}
@@ -131,7 +145,10 @@ def start_analyze(req: AnalyzeRequest):
     task_id = uuid.uuid4().hex[:12]
     with _lock:
         _tasks[task_id] = {"status": "queued", "message": "排队中…"}
-    threading.Thread(target=_run_task, args=(task_id, bvid), daemon=True).start()
+    cfg = {k: v for k, v in {"api_key": req.api_key, "base_url": req.base_url,
+                             "model": req.model, "price_in": req.price_in,
+                             "price_out": req.price_out}.items() if v is not None}
+    threading.Thread(target=_run_task, args=(task_id, bvid, cfg), daemon=True).start()
     return {"task_id": task_id}
 
 

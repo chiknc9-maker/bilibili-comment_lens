@@ -29,7 +29,16 @@ API = "https://api.bilibili.com"
 TYPE_VIDEO = "1"  # 视频评论的 type 值
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-OUT_DIR = Path(__file__).parent / "data"
+def _app_dir():
+    """打包后取 exe 所在目录（数据写在旁边），开发时取脚本所在目录。"""
+    import sys
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+APP_DIR = _app_dir()
+OUT_DIR = APP_DIR / "data"
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -51,7 +60,7 @@ def build_headers() -> dict:
     - 匿名时只带 UA（实测：无 cookie 却带 Referer 会触发 B站 412 风控）
     - 提供 cookie 时才带 Referer + Cookie，模拟完整浏览器身份
     """
-    env = dotenv_values(Path(__file__).parent / ".env")
+    env = dotenv_values(APP_DIR / ".env")
     cookies = []
     if env.get("SESSDATA"):
         cookies.append(f"SESSDATA={env['SESSDATA']}")

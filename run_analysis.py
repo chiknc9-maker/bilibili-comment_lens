@@ -20,7 +20,15 @@ from analyze.llm import DeepSeekClient
 from analyze.pipeline import make_graph
 from analyze.preprocess import build_corpus_text, estimate_chars, load_threads
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+def _app_dir():
+    """打包后取 exe 所在目录（报告写在旁边），开发时取脚本所在目录。"""
+    import sys as _sys
+    if getattr(_sys, "frozen", False):
+        return Path(_sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+PROJECT_ROOT = _app_dir()
 sys.path.insert(0, str(PROJECT_ROOT))
 
 # DeepSeek 价格（2026-09 快照，仅供预算提示，以官方为准）
@@ -28,7 +36,8 @@ PRICE_PER_M_IN = 2.0   # 元/百万输入 token
 PRICE_PER_M_OUT = 8.0  # 元/百万输出 token
 
 
-def analyze_comments(json_path: Path, use_cache: bool = True) -> dict:
+def analyze_comments(json_path: Path, use_cache: bool = True,
+                     llm_config: dict | None = None) -> dict:
     """分析评论 JSON（预处理→LangGraph 管线），返回结果 dict：
     {meta, report_md, 及各节点结构化结果}。供 CLI 与网页服务共用。"""
     meta, threads = load_threads(json_path)
@@ -38,7 +47,7 @@ def analyze_comments(json_path: Path, use_cache: bool = True) -> dict:
     print(f"  参与分析: {len(threads)} 条主评论，约 {chars} 字符 ≈ "
           f"{chars//2}~{chars//1} token（中文约 1 token/字）")
 
-    llm = DeepSeekClient(cache_enabled=use_cache)
+    llm = DeepSeekClient(cache_enabled=use_cache, **(llm_config or {}))
     print(f"  模型应答: {llm.ping()}（key 有效）")
     graph = make_graph(llm)
     t0 = time.time()
@@ -48,6 +57,7 @@ def analyze_comments(json_path: Path, use_cache: bool = True) -> dict:
         "corpus_text": corpus,
         "threads_total": len(threads),
     })
+    result["prices"] = {"in": llm.price_in, "out": llm.price_out}
     result["usage"] = {"prompt_tokens": llm.total_usage.get("prompt_tokens", 0),
                        "completion_tokens": llm.total_usage.get("completion_tokens", 0),
                        "total_tokens": llm.total_usage.get("total_tokens", 0),
@@ -82,8 +92,8 @@ def save_report(result: dict, out_dir: Path) -> Path:
                    ("prompt_tokens", "completion_tokens", "total_tokens", "calls")},
         "cache_hits": usage.get("cache_hits", 0),
         "cost_cny_est": round(
-            ((usage.get("prompt_tokens", 0) * PRICE_PER_M_IN
-              + usage.get("completion_tokens", 0) * PRICE_PER_M_OUT) / 1e6), 4),
+            ((usage.get("prompt_tokens", 0) * (result.get("prices") or {}).get("in", PRICE_PER_M_IN)
+              + usage.get("completion_tokens", 0) * (result.get("prices") or {}).get("out", PRICE_PER_M_OUT)) / 1e6), 4),
         "degraded": bool((result.get("claims") or {}).get("degraded")),
     }
     with (out_dir / "_run_log.jsonl").open("a", encoding="utf-8") as f:
