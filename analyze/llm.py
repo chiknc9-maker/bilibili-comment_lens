@@ -103,6 +103,13 @@ class LLMError(RuntimeError):
     pass
 
 
+class LLMConfigError(LLMError, ValueError):
+    """配置错误（如缺 API key）：确定性失败，不该被自动重试。
+
+    同时继承 ValueError，让 web/app.py 的 _retryable 与 CLI 的输入校验都能识别。
+    """
+
+
 class LLMTruncatedError(LLMError):
     """输出被 max_tokens 截断（finish_reason=length），JSON 不完整。
 
@@ -124,7 +131,7 @@ class DeepSeekClient:
                  price_out: float | None = None):
         api_key = (api_key or ENV.get("DEEPSEEK_API_KEY", "") or "").strip()
         if not api_key:
-            raise LLMError(
+            raise LLMConfigError(
                 "未找到 API key：请复制 .env.example 为 .env 填入，"
                 "或在网页版的高级设置里填写自己的 key"
             )

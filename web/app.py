@@ -32,6 +32,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import fetch_comments as fc        # noqa: E402
 import run_analysis as ra          # noqa: E402
+from analyze.llm import ENV as LLM_ENV  # noqa: E402
 
 app = FastAPI(title="评论透镜")
 
@@ -74,7 +75,8 @@ ANALYSIS_RETRY_DELAYS = [15, 30]  # 分析失败很快能再试（本地缓存�
 def _retryable(e: BaseException) -> bool:
     """哪些失败值得自动重试：缺 key / 鉴权失败 / 非法输入是确定性的，不重试。"""
     msg = str(e)
-    if "DEEPSEEK_API_KEY" in msg or "'401" in msg or "'403" in msg:
+    if ("DEEPSEEK_API_KEY" in msg or "API key" in msg
+            or "'401" in msg or "'403" in msg):
         return False
     if isinstance(e, ValueError):
         return False
@@ -142,6 +144,14 @@ def start_analyze(req: AnalyzeRequest):
         bvid = fc.parse_bvid(req.url)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    # 缺 key 是确定性错误：立刻挡掉，别让用户白等一两分钟抓取
+    if not ((req.api_key or "").strip()
+            or (LLM_ENV.get("DEEPSEEK_API_KEY") or "").strip()):
+        raise HTTPException(
+            status_code=400,
+            detail="还没有 API Key：请展开页面上的「高级设置」填写自己的 key"
+                   "（DeepSeek 或其他 OpenAI 兼容服务），或在 .env 里配置 DEEPSEEK_API_KEY。",
+        )
     task_id = uuid.uuid4().hex[:12]
     with _lock:
         _tasks[task_id] = {"status": "queued", "message": "排队中…"}
